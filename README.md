@@ -1,12 +1,36 @@
 # Aegis
 
-An evidence-first AI SRE copilot for a toy production environment.
+### An evidence-first AI SRE copilot for a toy production environment
 
-Aegis continuously watches a two-service application, turns related metric anomalies into one incident, gives an investigator read access to metrics, structured logs, runbooks, and the incident timeline, then proposes a bounded remediation. A human must approve the recommendation before it can execute.
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-control--plane-009688?logo=fastapi&logoColor=white)
+![Docker Compose](https://img.shields.io/badge/Docker_Compose-ready-2496ED?logo=docker&logoColor=white)
 
-The project is deliberately runnable without an API key. In local-fallback mode it still performs the full telemetry and approval workflow deterministically; with `OPENAI_API_KEY` set, the same investigator uses a Chat Completions tool-calling loop.
+Aegis watches a small checkout-and-inventory application, detects abnormal behavior, correlates related signals into incidents, investigates them using real telemetry and runbooks, and proposes a bounded remediation.
 
-## What is included
+> Aegis is a local observability and incident-response demo. It does not replace production alerting, authentication, on-call infrastructure, or change-management controls.
+
+It is deliberately runnable without an API key. Local fallback mode performs the complete telemetry and approval workflow deterministically; setting `OPENAI_API_KEY` enables the optional tool-calling investigator.
+
+| Start here | Link |
+|---|---|
+| Control room | <http://localhost:8000> |
+| Grafana signals | <http://localhost:3001> or <http://localhost:3002> |
+| Quick demo | [Run Aegis](#run-aegis) |
+| Safety model | [Human-approved remediation](#safety-model-and-design-decisions) |
+
+## Contents
+
+- [What Aegis demonstrates](#what-aegis-demonstrates)
+- [Run Aegis](#run-aegis)
+- [Demo workflow](#demo-workflow-at-a-glance)
+- [Architecture](#architecture)
+- [Useful API calls](#useful-api-calls)
+- [Local development](#local-development)
+- [Safety and design decisions](#safety-model-and-design-decisions)
+- [Troubleshooting](#troubleshooting)
+
+## What Aegis demonstrates
 
 - `checkout` calls `inventory`, exposes Prometheus metrics, and emits JSONL logs.
 - Bounded chaos for latency, 5xx errors, dependency failure, and CPU stress.
@@ -18,25 +42,29 @@ The project is deliberately runnable without an API key. In local-fallback mode 
 - A small web control room showing incident state, evidence, timeline, metrics, and the approval gate.
 - SQLite incident history and MTTR calculation.
 
-## Run it
+## Run Aegis
 
 Requirements: Docker Desktop or another Docker Engine with Compose.
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose up --build -d
 ```
 
 Open:
 
 - Aegis control room: <http://localhost:8000>
-- Grafana: <http://localhost:3001>
+- Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied)
 - Prometheus: <http://localhost:9091>
 - Checkout: <http://localhost:8080>
 - Inventory: <http://localhost:8081>
 
 If host port 3001 is already in use, start Aegis Grafana on another port without changing the
-other services: `GRAFANA_PORT=3002 docker compose up --build`.
+other services:
+
+```bash
+GRAFANA_PORT=3002 docker compose up --build -d
+```
 
 The control room is the recommended demo surface. If you want traffic before injecting a fault:
 
@@ -93,6 +121,15 @@ The key is only used by the control-plane investigator. The agent still has the 
 
 The Compose topology is the reliable local demo. The service container boundaries and HTTP admin surface make it straightforward to move the demo services to Kubernetes later; the important safety boundary is that the executor talks only to explicit service endpoints and does not receive a cluster-admin credential.
 
+## Demo workflow at a glance
+
+```text
+traffic → metrics/logs → detection → correlation → investigation
+       → recommendation_pending → human approval → safe remediation → resolution
+```
+
+The dashboard is the best place to watch the workflow, while Grafana provides the underlying Prometheus and Loki data.
+
 ## Useful API calls
 
 ```bash
@@ -117,7 +154,7 @@ curl -X POST http://localhost:8000/api/incidents/<incident-id>/execute \
 
 ```bash
 python3 -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -e '.[dev]'
 pytest -q
 ruff check aegis tests scripts
@@ -125,10 +162,43 @@ ruff check aegis tests scripts
 
 Run a service locally with `SERVICE_NAME=inventory python3 -m aegis.service_main` or run the control plane with `python3 -m aegis.control_main`. For local Python processes, use `.env.example` values and make sure Prometheus is available at `localhost:9090`.
 
-## Design decisions worth discussing
+## Safety model and design decisions
 
 1. The agent is a copilot, not a captain. Recommendations are auditable proposals; execution requires a named approver and a second API call.
 2. Correlation is explicit. Alert rules provide a root-cause key, and dependency evidence can rewrite checkout symptoms to `dependency:inventory`.
 3. Evidence is first-class. Every investigation stores the metrics query/value, log observations, runbook excerpt, and tool names used.
 4. The fallback investigator is intentional. A demo should work in a clean environment, while the LLM path is a replaceable reasoning layer rather than a hidden dependency.
 5. The chaos surface is bounded. It can stress only this demo's own process and service state; there is no arbitrary command or infrastructure mutation API.
+
+## Troubleshooting
+
+### `python: command not found`
+
+Activate the project environment:
+
+```bash
+source .venv/bin/activate
+```
+
+Or call its interpreter directly:
+
+```bash
+.venv/bin/python scripts/smoke.py --count 100
+```
+
+### Grafana port `3001` is already in use
+
+```bash
+GRAFANA_PORT=3002 docker compose up --build -d
+```
+
+### Inspect or stop the stack
+
+```bash
+docker compose logs -f control checkout inventory
+docker compose down
+```
+
+## Current scope
+
+This repository provides dashboard and API-based incident visibility. Email, Slack, PagerDuty, and mobile notifications are not included yet. The demo uses simulated faults and simulated scaling instead of changing real infrastructure.
