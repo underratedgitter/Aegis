@@ -1,0 +1,18 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"datasource": {"type": "prometheus", "uid": "Prometheus"}, "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "id": 1, "targets": [{"expr": "sum(rate(aegis_http_requests_total{service=\"checkout\",status=~\"5..\"}[2m])) / clamp_min(sum(rate(aegis_http_requests_total{service=\"checkout\"}[2m])), 0.001)", "legendFormat": "checkout error rate"}], "title": "Checkout error rate", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "Prometheus"}, "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "id": 2, "targets": [{"expr": "histogram_quantile(0.95, sum(rate(aegis_http_request_duration_seconds_bucket{service=\"checkout\"}[2m])) by (le))", "legendFormat": "p95"}], "title": "Checkout p95 latency", "type": "timeseries"},
+    {"datasource": {"type": "loki", "uid": "Loki"}, "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}, "id": 3, "targets": [{"expr": "{job=\"aegis\"} |= \"failure\"", "queryType": "range", "refId": "A"}], "title": "Failure logs", "type": "logs"}
+  ],
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["aegis", "sre"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timezone": "browser",
+  "title": "Aegis / Production Signals",
+  "version": 1
+}
+

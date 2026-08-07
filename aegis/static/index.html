@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aegis · AI SRE Copilot</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">✦</span><span>Aegis</span><small>AI SRE copilot</small></div>
+    <div class="topbar-actions"><span id="engine-status" class="pill muted">connecting</span><button id="refresh">Refresh</button></div>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Production control room</p>
+        <h1>Stay ahead of the incident.</h1>
+        <p class="subhead">Telemetry, evidence, and human-approved remediation in one loop.</p>
+      </div>
+      <div class="hero-note"><span class="pulse"></span><span id="last-updated">Loading live state…</span></div>
+    </section>
+
+    <section class="stat-grid">
+      <article class="stat-card"><span>Open incidents</span><strong id="open-incidents">—</strong><small>correlated by root cause</small></article>
+      <article class="stat-card"><span>MTTR</span><strong id="mttr">—</strong><small>resolved incidents</small></article>
+      <article class="stat-card"><span>Telemetry</span><strong id="telemetry">—</strong><small>Prometheus · Loki</small></article>
+      <article class="stat-card"><span>Demo services</span><strong id="services">—</strong><small>checkout · inventory</small></article>
+      <article class="stat-card"><span>Error budget</span><strong id="error-budget">—</strong><small>checkout · rolling 30m</small></article>
+    </section>
+
+    <section class="workspace">
+      <aside class="panel incident-panel">
+        <div class="panel-heading"><div><p class="eyebrow">Live queue</p><h2>Incidents</h2></div><span id="incident-count" class="count">0</span></div>
+        <div id="incident-list" class="incident-list"><div class="empty">No incidents yet.<br><span>Use the chaos controls below to create one.</span></div></div>
+      </aside>
+
+      <section class="panel detail-panel">
+        <div id="detail-empty" class="empty detail-empty"><div class="empty-icon">⌁</div><h2>Select an incident</h2><p>The agent’s investigation trail and recommendation will appear here.</p></div>
+        <div id="detail" class="hidden">
+          <div class="detail-heading"><div><div id="detail-severity"></div><h2 id="detail-title"></h2><p id="detail-meta"></p></div><span id="detail-status" class="status"></span></div>
+          <div id="recommendation-card" class="recommendation-card"></div>
+          <div class="columns">
+            <div><p class="eyebrow">Agent investigation</p><div id="hypothesis" class="hypothesis"></div><div id="evidence" class="evidence"></div></div>
+            <div><p class="eyebrow">Timeline</p><div id="timeline" class="timeline"></div></div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="lower-grid">
+      <article class="panel telemetry-panel"><div class="panel-heading"><div><p class="eyebrow">Signals</p><h2>Metric snapshot</h2></div><span class="live-dot">LIVE</span></div><div id="metrics" class="metrics"></div></article>
+      <article class="panel chaos-panel"><div class="panel-heading"><div><p class="eyebrow">Controlled chaos</p><h2>Break production</h2></div></div><p class="panel-copy">Inject a bounded failure. Aegis detects it, gathers evidence, and proposes a safe fix.</p><div class="chaos-form"><select id="chaos-service"><option value="inventory">inventory</option><option value="checkout">checkout</option></select><select id="chaos-fault"><option value="dependency">dependency failure</option><option value="latency">latency spike</option><option value="errors">5xx errors</option><option value="cpu">CPU stress</option></select><input id="chaos-duration" type="number" min="5" value="60"><button id="inject">Inject fault</button></div><div id="chaos-result" class="form-result"></div></article>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

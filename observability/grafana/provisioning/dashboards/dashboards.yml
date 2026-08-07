@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Aegis
+    orgId: 1
+    folder: Aegis
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards
+
