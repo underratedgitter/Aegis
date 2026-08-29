@@ -32,11 +32,33 @@
     <section class="workspace">
       <aside class="panel incident-panel">
         <div class="panel-heading"><div><p class="eyebrow">Live queue</p><h2>Incidents</h2></div><span id="incident-count" class="count">0</span></div>
+        <div class="filter-bar">
+          <input id="incident-search" type="text" placeholder="Search incidents…" />
+          <select id="incident-status-filter">
+            <option value="">All statuses</option>
+            <option value="open">Open</option>
+            <option value="investigating">Investigating</option>
+            <option value="recommendation_pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="resolved">Resolved</option>
+          </select>
+          <select id="incident-severity-filter">
+            <option value="">All severities</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
         <div id="incident-list" class="incident-list"><div class="empty">No incidents yet.<br><span>Use the chaos controls below to create one.</span></div></div>
+        <div class="panel-actions">
+          <button class="secondary small" onclick="batchApprove()">Batch Approve</button>
+          <button class="secondary small" onclick="exportIncidents('json')">Export JSON</button>
+          <button class="secondary small" onclick="exportIncidents('csv')">Export CSV</button>
+        </div>
       </aside>
 
       <section class="panel detail-panel">
-        <div id="detail-empty" class="empty detail-empty"><div class="empty-icon">⌁</div><h2>Select an incident</h2><p>The agent’s investigation trail and recommendation will appear here.</p></div>
+        <div id="detail-empty" class="empty detail-empty"><div class="empty-icon">⌁</div><h2>Select an incident</h2><p>The agent's investigation trail and recommendation will appear here.</p></div>
         <div id="detail" class="hidden">
           <div class="detail-heading"><div><div id="detail-severity"></div><h2 id="detail-title"></h2><p id="detail-meta"></p></div><span id="detail-status" class="status"></span></div>
           <div id="recommendation-card" class="recommendation-card"></div>
