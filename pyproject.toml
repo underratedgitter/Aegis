@@ -1,6 +1,6 @@
 [project]
 name = "aegis"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local AI SRE copilot with evidence-first investigation and guardrailed remediation"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,16 +22,67 @@ include = ["aegis*"]
 [project.optional-dependencies]
 dev = [
   "pytest>=8,<9",
+  "pytest-cov>=5,<6",
+  "pytest-asyncio>=0.23,<1",
   "ruff>=0.6,<1",
+  "mypy>=1.10,<2",
+  "pre-commit>=3,<4",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "integration: marks tests as integration tests",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "I",    # isort
+  "N",    # pep8-naming
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "A",    # flake8-builtins
+  "C4",   # flake8-comprehensions
+  "SIM",  # flake8-simplify
+  "TCH",  # flake8-type-checking
+  "RUF",  # ruff-specific
+]
+ignore = [
+  "E501",   # line too long (handled by formatter)
+  "B008",   # do not perform function calls in argument defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aegis"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[tool.coverage.run]
+source = ["aegis"]
+omit = ["tests/*", "scripts/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.",
+]

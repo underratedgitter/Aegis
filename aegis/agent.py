@@ -1,10 +1,19 @@
+"""Evidence-first investigator with optional LLM tool-calling loop."""
+
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from aegis.models import (
+    Evidence,
+    InvestigationMode,
+    Recommendation,
+    RemediationAction,
+)
 from aegis.settings import Settings
 from aegis.storage import Store, utc_now
 from aegis.telemetry import Telemetry
@@ -19,21 +28,35 @@ class AgentInvestigator:
         self.telemetry = telemetry
 
     def investigate(self, incident_id: str) -> dict[str, Any]:
+        """
+        Investigate an incident using either LLM or local fallback.
+
+        Args:
+            incident_id: The ID of the incident to investigate.
+
+        Returns:
+            Investigation result dictionary.
+
+        Raises:
+            ValueError: If incident not found.
+        """
         incident = self.store.get_incident(incident_id)
         if not incident:
-            raise ValueError("incident not found")
+            raise ValueError("Incident not found")
+
         result: dict[str, Any]
         if os.getenv("OPENAI_API_KEY"):
             try:
                 result = self._llm_investigation(incident)
-                result["mode"] = "llm_tool_calling"
+                result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
             except Exception as exc:
                 result = self._local_investigation(incident)
-                result["mode"] = "local_fallback"
+                result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
                 result["fallback_reason"] = str(exc)
         else:
             result = self._local_investigation(incident)
-            result["mode"] = "local_fallback"
+            result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
+
         data = {
             **incident["data"],
             "investigation": result,
@@ -50,78 +73,48 @@ class AgentInvestigator:
         return result
 
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
+        """Perform investigation using local tools without LLM."""
         root = incident["root_cause_key"]
         metrics = self._call_tool("get_current_metrics", {}, incident["id"])
         logs = self._call_tool("get_recent_logs", {"limit": 12}, incident["id"])
         timeline = self._call_tool("get_incident_timeline", {}, incident["id"])
         runbook_slug = self._runbook_slug(root)
         runbook = self._call_tool("read_runbook", {"slug": runbook_slug}, incident["id"])
+
         evidence = [
-            {
-                "source": "prometheus",
-                "label": item["name"],
-                "detail": f"value={item.get('value')} query={item.get('query')}",
-            }
+            Evidence(
+                source="prometheus",
+                label=item["name"],
+                detail=f"value={item.get('value')} query={item.get('query')}",
+            )
             for item in metrics
             if item.get("value") is not None
         ]
         evidence += [
-            {"source": "logs", "label": "recent structured logs", "detail": item.get("message", "")}
+            Evidence(
+                source="logs",
+                label="recent structured logs",
+                detail=item.get("message", ""),
+            )
             for item in logs[:4]
         ]
         evidence += [
-            {
-                "source": "timeline",
-                "label": item.get("kind", "event"),
-                "detail": item.get("message", ""),
-            }
+            Evidence(
+                source="timeline",
+                label=item.get("kind", "event"),
+                detail=item.get("message", ""),
+            )
             for item in timeline[-3:]
         ]
-        evidence.append({"source": "runbook", "label": runbook_slug, "detail": runbook[:280]})
-        if root == "dependency:inventory":
-            hypothesis = (
-                "Inventory is failing or timing out, causing checkout errors through its "
-                "upstream dependency boundary."
-            )
-            recommendation = {
-                "action": "clear_fault",
-                "target": "inventory",
-                "parameters": {"fault": "dependency"},
-                "reason": (
-                    "The known-safe action clears the injected inventory dependency fault; "
-                    "it does not grant arbitrary command execution."
-                ),
-            }
-        elif root == "service:checkout:cpu":
-            hypothesis = (
-                "Synthetic CPU stress is active on checkout and is consuming worker capacity."
-            )
-            recommendation = {
-                "action": "clear_fault",
-                "target": "checkout",
-                "parameters": {"fault": "cpu"},
-                "reason": "Clear the bounded chaos fault after human approval.",
-            }
-        else:
-            hypothesis = (
-                "Checkout is unhealthy; the available telemetry points to an application-level "
-                "fault that needs confirmation before broader action."
-            )
-            recommendation = {
-                "action": "clear_fault",
-                "target": "checkout",
-                "parameters": {"fault": "errors"},
-                "reason": (
-                    "Clear the known demo fault only after an operator confirms the evidence."
-                ),
-            }
+        evidence.append(Evidence(source="runbook", label=runbook_slug, detail=runbook[:280]))
+
+        hypothesis, confidence, recommendation = self._generate_recommendation(root)
+
         return {
             "hypothesis": hypothesis,
-            "confidence": "high"
-            if root in {"dependency:inventory", "service:checkout:cpu"}
-            else "medium",
-            "evidence": evidence,
-            "recommendation": recommendation,
+            "confidence": confidence,
+            "evidence": [e.model_dump() for e in evidence],
+            "recommendation": recommendation.model_dump(),
             "next_checks": [
                 "Confirm the error rate and p95 latency return below threshold",
                 "Watch the incident for two healthy polling cycles",
@@ -135,7 +128,52 @@ class AgentInvestigator:
             "generated_at": utc_now(),
         }
 
+    def _generate_recommendation(self, root: str) -> tuple[str, str, Recommendation]:
+        """Generate hypothesis, confidence, and recommendation based on root cause."""
+        if root == "dependency:inventory":
+            hypothesis = (
+                "Inventory is failing or timing out, causing checkout errors through its "
+                "upstream dependency boundary."
+            )
+            recommendation = Recommendation(
+                action=RemediationAction.CLEAR_FAULT,
+                target="inventory",
+                parameters={"fault": "dependency"},
+                reason=(
+                    "The known-safe action clears the injected inventory dependency fault; "
+                    "it does not grant arbitrary command execution."
+                ),
+            )
+            return hypothesis, "high", recommendation
+
+        if root == "service:checkout:cpu":
+            hypothesis = (
+                "Synthetic CPU stress is active on checkout and is consuming worker capacity."
+            )
+            recommendation = Recommendation(
+                action=RemediationAction.CLEAR_FAULT,
+                target="checkout",
+                parameters={"fault": "cpu"},
+                reason="Clear the bounded chaos fault after human approval.",
+            )
+            return hypothesis, "high", recommendation
+
+        hypothesis = (
+            "Checkout is unhealthy; the available telemetry points to an application-level "
+            "fault that needs confirmation before broader action."
+        )
+        recommendation = Recommendation(
+            action=RemediationAction.CLEAR_FAULT,
+            target="checkout",
+            parameters={"fault": "errors"},
+            reason=(
+                "Clear the known demo fault only after an operator confirms the evidence."
+            ),
+        )
+        return hypothesis, "medium", recommendation
+
     def _llm_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
+        """Perform investigation using OpenAI tool-calling."""
         from openai import OpenAI
 
         client = OpenAI()
@@ -160,21 +198,29 @@ class AgentInvestigator:
                 ),
             },
         ]
+
         for _ in range(6):
             response = client.chat.completions.create(
-                model=self.settings.openai_model, messages=messages, tools=tools, tool_choice="auto"
+                model=self.settings.openai_model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
             )
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
+
             if not tool_calls:
                 content = message.content or "{}"
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
-                    parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
+                    parsed = json.loads(
+                        content.replace("```json", "").replace("```", "").strip()
+                    )
                 parsed.setdefault("tools_used", [])
                 parsed.setdefault("generated_at", utc_now())
                 return parsed
+
             messages.append(
                 {
                     "role": "assistant",
@@ -182,15 +228,18 @@ class AgentInvestigator:
                     "tool_calls": [call.model_dump() for call in tool_calls],
                 }
             )
+
             for call in tool_calls:
                 arguments = json.loads(call.function.arguments or "{}")
                 result = self._call_tool(call.function.name, arguments, incident["id"])
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)}
                 )
-        raise RuntimeError("agent exceeded tool-call budget")
+
+        raise RuntimeError("Agent exceeded tool-call budget")
 
     def _call_tool(self, name: str, arguments: dict[str, Any], incident_id: str) -> Any:
+        """Dispatch tool calls to the appropriate handler."""
         tools: dict[str, Callable[..., Any]] = {
             "get_current_metrics": lambda query=None: (
                 self.telemetry.prometheus_query(query)
@@ -204,22 +253,22 @@ class AgentInvestigator:
             "get_incident_timeline": lambda: self.store.events(incident_id),
         }
         if name not in tools:
-            raise ValueError(f"unknown tool: {name}")
+            raise ValueError(f"Unknown tool: {name}")
         return tools[name](**arguments)
 
     def _read_runbook(self, slug: str) -> str:
+        """Read a runbook by slug, with path traversal protection."""
         safe_slug = Path(slug).name
         path = Path(self.settings.runbook_dir) / (
             safe_slug if safe_slug.endswith(".md") else f"{safe_slug}.md"
         )
         if not path.exists():
-            return (
-                "No matching runbook found. Treat this as ambiguous and do not broaden remediation."
-            )
+            return "No matching runbook found. Treat this as ambiguous and do not broaden remediation."
         return path.read_text(encoding="utf-8")
 
     @staticmethod
     def _runbook_slug(root: str) -> str:
+        """Map root cause key to runbook slug."""
         if root == "dependency:inventory":
             return "inventory-dependency-failure"
         if root == "service:checkout:cpu":
@@ -228,6 +277,7 @@ class AgentInvestigator:
 
     @staticmethod
     def _tool_schemas() -> list[dict[str, Any]]:
+        """Return OpenAI tool schemas for the investigator."""
         return [
             {
                 "type": "function",

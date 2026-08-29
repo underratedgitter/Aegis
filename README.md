@@ -46,12 +46,16 @@ It is deliberately runnable without an API key. Local fallback mode performs the
 
 Requirements: Docker Desktop or another Docker Engine with Compose.
 
+If your Docker context is Colima on macOS, `make start` automatically starts Colima when it is
+stopped. You can disable that behavior with `AUTO_START_DOCKER=0 make start`.
+
 ```bash
 cp .env.example .env
-docker compose up --build -d
+make start
 ```
 
-Open:
+`make start` builds and starts every container in the background, waits for the control room,
+and opens the local pages automatically:
 
 - Aegis control room: <http://localhost:8000>
 - Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied)
@@ -59,11 +63,14 @@ Open:
 - Checkout: <http://localhost:8080>
 - Inventory: <http://localhost:8081>
 
-If host port 3001 is already in use, start Aegis Grafana on another port without changing the
-other services:
+On macOS, you can also double-click [`start.command`](start.command) to run the same startup
+flow. To start the stack without opening browser tabs, use `OPEN_BROWSER=0 make start`.
+
+If host port 3001 is already in use, `make start` automatically selects the next available
+Grafana port. You can also choose one explicitly without changing the other services:
 
 ```bash
-GRAFANA_PORT=3002 docker compose up --build -d
+GRAFANA_PORT=3002 make start
 ```
 
 The control room is the recommended demo surface. If you want traffic before injecting a fault:
@@ -186,17 +193,17 @@ Or call its interpreter directly:
 .venv/bin/python scripts/smoke.py --count 100
 ```
 
-### Grafana port `3001` is already in use
+### Choose a Grafana port
 
 ```bash
-GRAFANA_PORT=3002 docker compose up --build -d
+GRAFANA_PORT=3002 make start
 ```
 
 ### Inspect or stop the stack
 
 ```bash
 docker compose logs -f control checkout inventory
-docker compose down
+make down
 ```
 
 ## Current scope

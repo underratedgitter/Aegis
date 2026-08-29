@@ -23,7 +23,7 @@ def test_validate_recommendation_rejects_unbounded_or_mismatched_actions(tmp_pat
         Store(str(tmp_path / "db.sqlite")),
     )
 
-    with pytest.raises(RemediationError, match="fault is outside"):
+    with pytest.raises(RemediationError, match="[Ff]ault is outside"):
         executor.validate_recommendation(
             {
                 "action": "clear_fault",
@@ -72,12 +72,13 @@ def test_execute_uses_the_approved_recommendation_snapshot(tmp_path, monkeypatch
 
     calls = []
 
-    def fake_post(url, json, timeout):
-        calls.append((url, json, timeout))
+    def fake_post(url, json, timeout=None):
+        calls.append((url, json))
         return FakeResponse()
 
-    monkeypatch.setattr("aegis.remediation.httpx.post", fake_post)
-    result = RemediationExecutor(settings, store).execute(incident["id"], "operator")
+    executor = RemediationExecutor(settings, store)
+    monkeypatch.setattr(executor._client, "post", fake_post)
+    result = executor.execute(incident["id"], "operator")
 
     assert result["target"] == "inventory"
-    assert calls == [("http://inventory/admin/faults/clear", {"fault": "dependency"}, 5)]
+    assert calls == [("http://inventory/admin/faults/clear", {"fault": "dependency"})]
