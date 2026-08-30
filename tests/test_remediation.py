@@ -23,7 +23,7 @@ def test_validate_recommendation_rejects_unbounded_or_mismatched_actions(tmp_pat
         Store(str(tmp_path / "db.sqlite")),
     )
 
-    with pytest.raises(RemediationError, match="[Ff]ault is outside"):
+    with pytest.raises(RemediationError, match=r"[Ff]ault is outside"):
         executor.validate_recommendation(
             {
                 "action": "clear_fault",

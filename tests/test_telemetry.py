@@ -149,3 +149,59 @@ class TestTelemetry:
             assert slo.actual is not None
             assert 0.99 <= slo.actual <= 1.0
             assert slo.error_budget_remaining is not None
+
+
+class TestTailReader:
+    """recent_logs reads the end of a log file rather than loading all of it."""
+
+    def _write(self, tmp_path, line_count, trailing_newline=True):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / "checkout.jsonl"
+        lines = [
+            json.dumps(
+                {"service": "checkout", "ts": f"2024-01-01T00:{i // 60:02d}:{i % 60:02d}",
+                 "message": f"log{i}", "pad": "x" * 200}
+            )
+            for i in range(line_count)
+        ]
+        log_file.write_text("\n".join(lines) + ("\n" if trailing_newline and lines else ""))
+        return log_dir, log_file
+
+    def test_tail_matches_a_full_read(self, tmp_path):
+        _, log_file = self._write(tmp_path, 5000)
+        expected = log_file.read_text().splitlines()[-25:]
+        assert Telemetry._tail_lines(log_file, 25) == expected
+
+    def test_tail_spans_multiple_chunks(self, tmp_path):
+        """A small chunk size forces several backward reads."""
+        _, log_file = self._write(tmp_path, 500)
+        expected = log_file.read_text().splitlines()[-40:]
+        assert Telemetry._tail_lines(log_file, 40, chunk_size=64) == expected
+
+    def test_tail_without_trailing_newline(self, tmp_path):
+        _, log_file = self._write(tmp_path, 30, trailing_newline=False)
+        expected = log_file.read_text().splitlines()[-10:]
+        assert Telemetry._tail_lines(log_file, 10) == expected
+
+    def test_tail_of_empty_file(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_file = log_dir / "empty.jsonl"
+        log_file.write_text("")
+        assert Telemetry._tail_lines(log_file, 10) == []
+
+    def test_tail_when_limit_exceeds_file_length(self, tmp_path):
+        _, log_file = self._write(tmp_path, 3)
+        assert len(Telemetry._tail_lines(log_file, 500)) == 3
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert Telemetry._tail_lines(tmp_path / "nope.jsonl", 10) == []
+
+    def test_recent_logs_returns_the_newest_entries(self, tmp_path):
+        log_dir, _ = self._write(tmp_path, 1000)
+        telemetry = Telemetry(Settings(log_dir=str(log_dir)))
+        result = telemetry.recent_logs(service="checkout", limit=5)
+        assert len(result) == 5
+        # Sorted newest first, so the final written line leads.
+        assert result[0]["message"] == "log999"

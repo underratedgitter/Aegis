@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aegis.models import (
     Evidence,
@@ -14,9 +13,13 @@ from aegis.models import (
     Recommendation,
     RemediationAction,
 )
-from aegis.settings import Settings
 from aegis.storage import Store, utc_now
-from aegis.telemetry import Telemetry
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from aegis.settings import Settings
+    from aegis.telemetry import Telemetry
 
 
 class AgentInvestigator:
@@ -69,7 +72,6 @@ class AgentInvestigator:
             f"Investigation complete ({result['mode']}): {result['hypothesis']}",
             {"citations": result.get("evidence", []), "mode": result["mode"]},
         )
-        self.store.db.commit()
         return result
 
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
@@ -200,7 +202,9 @@ class AgentInvestigator:
         ]
 
         for _ in range(6):
-            response = client.chat.completions.create(
+            # The message/tool payloads are built as plain dicts; the SDK accepts them
+            # at runtime but its overloads require the typed param classes.
+            response = client.chat.completions.create(  # type: ignore[call-overload]
                 model=self.settings.openai_model,
                 messages=messages,
                 tools=tools,
@@ -211,6 +215,7 @@ class AgentInvestigator:
 
             if not tool_calls:
                 content = message.content or "{}"
+                parsed: dict[str, Any]
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
@@ -241,10 +246,12 @@ class AgentInvestigator:
     def _call_tool(self, name: str, arguments: dict[str, Any], incident_id: str) -> Any:
         """Dispatch tool calls to the appropriate handler."""
         tools: dict[str, Callable[..., Any]] = {
+            # Tool results must be plain JSON-serialisable data: the local path
+            # reads them as dicts and the LLM path passes them through json.dumps.
             "get_current_metrics": lambda query=None: (
                 self.telemetry.prometheus_query(query)
                 if query
-                else self.telemetry.metric_snapshot()
+                else [snapshot.model_dump() for snapshot in self.telemetry.metric_snapshot()]
             ),
             "get_recent_logs": lambda service=None, limit=20: self.telemetry.recent_logs(
                 service, max(1, min(int(limit or 20), 200))

@@ -118,6 +118,8 @@ stateDiagram-v2
 | **SQL Injection** | Parameterized queries throughout `storage.py` |
 | **Path Traversal** | `Path(slug).name` in `_read_runbook()` |
 | **Timing Attacks** | `hmac.compare_digest()` for API key comparison |
+| **Auth on state changes** | `AEGIS_API_KEY`, when set, guards every mutating control-plane route |
+| **Bounded memory** | Audit buffer and rate-limit buckets are capped and evicted |
 | **Input Validation** | Pydantic models with regex patterns for fault types |
 | **Remediation Safety** | Allowlist-based actions, no shell/Docker access |
 | **Thread Safety** | `threading.RLock()` on all SQLite operations |
@@ -127,8 +129,8 @@ stateDiagram-v2
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| **No auth on admin endpoints** | Medium | Add `AEGIS_API_KEY` middleware to `/admin/*` routes |
-| **CORS allows `*`** | Low (demo) | Set `CORS_ORIGINS` env var for production |
+| **Demo services' `/admin/*` are unauthenticated** | Medium | Only reachable inside the Compose network; add auth before exposing them |
+| **CORS allows `*`** | Low (demo) | Credentials are disabled, so cookies are never sent cross-origin; restrict origins for production |
 | **In-memory rate limiting** | Low (single instance) | Use Redis for multi-instance deployments |
 | **No HTTPS enforcement** | Low | Handle at reverse proxy (nginx/traefik) |
 | **No request body size limit** | Medium | Add `app.add_middleware(BaseHTTPMiddleware, max_body_size=1_000_000)` |
@@ -140,7 +142,7 @@ stateDiagram-v2
 
 ### 🛡️ Security Recommendations
 
-1. **Enable API key auth** — Set `AEGIS_API_KEY` env var
+1. **Enable API key auth** — Set `AEGIS_API_KEY`; the control room UI does not send the header, so drive the API directly when it is on
 2. **Restrict CORS** — Set `CORS_ORIGINS=https://your-domain.com`
 3. **Add request body limits** — Prevent large payload attacks
 4. **Persist audit log** — Store in SQLite for compliance

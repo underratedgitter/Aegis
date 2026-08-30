@@ -63,7 +63,8 @@ class Store:
 
     def _rows(self, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         """Convert multiple database rows to dictionaries."""
-        return [self._row(row) for row in rows if row is not None]
+        converted = (self._row(row) for row in rows)
+        return [row for row in converted if row is not None]
 
     def list_incidents(self, limit: int = 50) -> list[dict[str, Any]]:
         """List incidents ordered by status priority and recency."""
@@ -125,7 +126,8 @@ class Store:
                     (now, json.dumps(merged), existing["id"]),
                 )
                 self.add_event(
-                    existing["id"], "signal", f"Signal still active: {title}", evidence
+                    existing["id"], "signal", f"Signal still active: {title}", evidence,
+                    commit=False,
                 )
                 self.db.commit()
                 return self.get_incident(existing["id"]) or existing, False
@@ -136,7 +138,9 @@ class Store:
                 "first_seen,last_seen,data_json) VALUES(?,?,?,?,?,?,?,?)",
                 (incident_id, title, severity, "open", root_cause_key, now, now, json.dumps(data)),
             )
-            self.add_event(incident_id, "detected", f"Incident detected: {title}", evidence)
+            self.add_event(
+                incident_id, "detected", f"Incident detected: {title}", evidence, commit=False
+            )
             self.db.commit()
             return self.get_incident(incident_id) or {}, True
 
@@ -152,7 +156,7 @@ class Store:
         with self.lock:
             self.db.execute(
                 f"UPDATE incidents SET {sql} WHERE id = ?",
-                tuple(updates.values()) + (incident_id,),
+                (*updates.values(), incident_id),
             )
             self.db.commit()
             return self.get_incident(incident_id)
@@ -163,13 +167,22 @@ class Store:
         kind: str,
         message: str,
         data: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> None:
-        """Add an event to an incident's timeline."""
+        """
+        Add an event to an incident's timeline.
+
+        Args:
+            commit: Persist immediately. Pass False only when the caller already
+                holds an open transaction that it commits itself.
+        """
         with self.lock:
             self.db.execute(
                 "INSERT INTO events(incident_id,at,kind,message,data_json) VALUES(?,?,?,?,?)",
                 (incident_id, utc_now(), kind, message, json.dumps(data or {})),
             )
+            if commit:
+                self.db.commit()
 
     def events(self, incident_id: str) -> list[dict[str, Any]]:
         """Get all events for an incident, ordered by time."""

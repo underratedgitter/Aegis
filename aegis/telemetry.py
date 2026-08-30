@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from aegis.models import MetricSnapshot, SLOSnapshot, TelemetryStatus
-from aegis.settings import Settings
+from aegis.queries import CHECKOUT_ERRORS_30M, CHECKOUT_REQUESTS_30M, SNAPSHOT_QUERIES
+
+if TYPE_CHECKING:
+    from aegis.settings import Settings
 
 
 class Telemetry:
@@ -54,33 +57,15 @@ class Telemetry:
 
     def metric_snapshot(self) -> list[MetricSnapshot]:
         """Get a snapshot of all key metrics."""
-        queries = {
-            "checkout_error_rate": (
-                'sum(rate(aegis_http_requests_total{service="checkout",status=~"5.."}[2m])) '
-                '/ clamp_min(sum(rate(aegis_http_requests_total{service="checkout"}[2m])), 0.001)'
-            ),
-            "checkout_p95_latency": (
-                "histogram_quantile(0.95, sum(rate(aegis_http_request_duration_seconds_bucket"
-                '{service="checkout"}[2m])) by (le))'
-            ),
-            "inventory_dependency_errors": (
-                'sum(rate(aegis_dependency_errors_total{service="checkout",dependency="inventory"}[2m]))'
-            ),
-            "checkout_cpu_burn": 'aegis_cpu_burn_active{service="checkout"}',
-        }
         return [
             MetricSnapshot(name=name, **self.prometheus_query(query))
-            for name, query in queries.items()
+            for name, query in SNAPSHOT_QUERIES.items()
         ]
 
     def slo_snapshot(self) -> SLOSnapshot:
         """Calculate the current SLO status for checkout service."""
-        total = self.prometheus_query(
-            'sum(increase(aegis_http_requests_total{service="checkout"}[30m]))'
-        ).get("value")
-        errors = self.prometheus_query(
-            'sum(increase(aegis_http_requests_total{service="checkout",status=~"5.."}[30m]))'
-        ).get("value")
+        total = self.prometheus_query(CHECKOUT_REQUESTS_30M).get("value")
+        errors = self.prometheus_query(CHECKOUT_ERRORS_30M).get("value")
         target = 0.995
         if not total:
             return SLOSnapshot(
@@ -101,20 +86,43 @@ class Telemetry:
             window="30m",
         )
 
+    @staticmethod
+    def _tail_lines(path: Path, limit: int, chunk_size: int = 65536) -> list[str]:
+        """
+        Read the last `limit` lines of a file without loading the whole file.
+
+        Log files grow for as long as the demo runs, so reading the tail keeps
+        memory flat regardless of file size.
+        """
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, 2)
+                end = handle.tell()
+                buffer = b""
+                # Read backwards until enough newlines are buffered, or the file starts.
+                while end > 0 and buffer.count(b"\n") <= limit:
+                    step = min(chunk_size, end)
+                    end -= step
+                    handle.seek(end)
+                    buffer = handle.read(step) + buffer
+        except OSError:
+            return []
+        return buffer.decode("utf-8", errors="replace").splitlines()[-limit:]
+
     def recent_logs(self, service: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
         """Read recent structured JSON logs from local files."""
-        files = sorted(
-            Path(self.settings.log_dir).glob("*.jsonl"),
-            key=lambda path: path.stat().st_mtime,
-        )
+        try:
+            files = sorted(
+                Path(self.settings.log_dir).glob("*.jsonl"),
+                key=lambda path: path.stat().st_mtime,
+            )
+        except OSError:
+            return []
         logs: list[dict[str, Any]] = []
         for path in files:
             if service and path.stem != service:
                 continue
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
-            except OSError:
-                continue
+            lines = self._tail_lines(path, limit)
             for line in lines:
                 try:
                     item = json.loads(line)

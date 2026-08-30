@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
-class IncidentStatus(str, Enum):
+class IncidentStatus(StrEnum):
     OPEN = "open"
     INVESTIGATING = "investigating"
     RECOMMENDATION_PENDING = "recommendation_pending"
@@ -19,19 +19,19 @@ class IncidentStatus(str, Enum):
     CLOSED = "closed"
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
 
 
-class InvestigationMode(str, Enum):
+class InvestigationMode(StrEnum):
     LOCAL_FALLBACK = "local_fallback"
     LLM_TOOL_CALLING = "llm_tool_calling"
 
 
-class RemediationAction(str, Enum):
+class RemediationAction(StrEnum):
     CLEAR_FAULT = "clear_fault"
     SCALE_SIMULATION = "scale_simulation"
 
@@ -59,7 +59,7 @@ class Investigation(BaseModel):
     recommendation: Recommendation
     next_checks: list[str] = Field(default_factory=list)
     tools_used: list[str] = Field(default_factory=list)
-    generated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    generated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     fallback_reason: str | None = None
 
 

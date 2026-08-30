@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 
 from aegis.models import RemediationAction
-from aegis.settings import Settings
 from aegis.storage import Store, utc_now
+
+if TYPE_CHECKING:
+    from aegis.settings import Settings
 
 
 class RemediationError(ValueError):
@@ -19,10 +21,12 @@ class RemediationError(ValueError):
 class RemediationExecutor:
     """Small, explicit action surface: no shell, Docker socket, or arbitrary URLs."""
 
-    ALLOWED_FAULTS = {"latency", "errors", "dependency", "cpu"}
-    ALLOWED_FAULTS_BY_TARGET = {
-        "checkout": {"latency", "errors", "cpu"},
-        "inventory": {"latency", "errors", "dependency"},
+    ALLOWED_FAULTS: ClassVar[frozenset[str]] = frozenset(
+        {"latency", "errors", "dependency", "cpu"}
+    )
+    ALLOWED_FAULTS_BY_TARGET: ClassVar[dict[str, frozenset[str]]] = {
+        "checkout": frozenset({"latency", "errors", "cpu"}),
+        "inventory": frozenset({"latency", "errors", "dependency"}),
     }
 
     def __init__(self, settings: Settings, store: Store):
@@ -96,7 +100,6 @@ class RemediationExecutor:
             f"Approved remediation executed by {approver}: {action} on {target}",
             {"action": action, "target": target, "approver": approver, "result": result},
         )
-        self.store.db.commit()
         return {
             "status": "executed",
             "incident_id": incident_id,

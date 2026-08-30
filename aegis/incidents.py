@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import threading
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aegis.agent import AgentInvestigator
 from aegis.anomaly import RollingZScoreDetector
 from aegis.models import AlertRule, Severity
-from aegis.settings import Settings
+from aegis.queries import (
+    CHECKOUT_CPU_BURN,
+    CHECKOUT_ERROR_RATE,
+    CHECKOUT_P95_LATENCY,
+    DEPENDENCY_ERROR_THRESHOLD,
+    INVENTORY_DEPENDENCY_ERRORS,
+)
 from aegis.storage import Store, utc_now
-from aegis.telemetry import Telemetry
+
+if TYPE_CHECKING:
+    from aegis.settings import Settings
+    from aegis.telemetry import Telemetry
 
 # ─── Alert Rules ──────────────────────────────────────────────────────────────
 
@@ -20,10 +29,7 @@ RULES = (
         name="checkout_error_rate",
         title="Checkout error rate is elevated",
         severity=Severity.HIGH,
-        query=(
-            'sum(rate(aegis_http_requests_total{service="checkout",status=~"5.."}[2m])) '
-            '/ clamp_min(sum(rate(aegis_http_requests_total{service="checkout"}[2m])), 0.001)'
-        ),
+        query=CHECKOUT_ERROR_RATE,
         threshold=0.15,
         root_cause_key="service:checkout",
     ),
@@ -31,10 +37,7 @@ RULES = (
         name="checkout_p95_latency",
         title="Checkout p95 latency is elevated",
         severity=Severity.MEDIUM,
-        query=(
-            "histogram_quantile(0.95, sum(rate(aegis_http_request_duration_seconds_bucket"
-            '{service="checkout"}[2m])) by (le))'
-        ),
+        query=CHECKOUT_P95_LATENCY,
         threshold=0.75,
         root_cause_key="service:checkout",
     ),
@@ -42,18 +45,15 @@ RULES = (
         name="inventory_dependency_errors",
         title="Checkout is receiving inventory dependency failures",
         severity=Severity.HIGH,
-        query=(
-            'sum(rate(aegis_dependency_errors_total{service="checkout",'
-            'dependency="inventory"}[2m]))'
-        ),
-        threshold=0.05,
+        query=INVENTORY_DEPENDENCY_ERRORS,
+        threshold=DEPENDENCY_ERROR_THRESHOLD,
         root_cause_key="dependency:inventory",
     ),
     AlertRule(
         name="checkout_cpu_burn",
         title="Checkout CPU stress is active",
         severity=Severity.MEDIUM,
-        query='aegis_cpu_burn_active{service="checkout"}',
+        query=CHECKOUT_CPU_BURN,
         threshold=0.5,
         root_cause_key="service:checkout:cpu",
     ),
@@ -116,10 +116,9 @@ class IncidentEngine:
             # rewrite root cause to dependency:inventory
             if rule.name in {"checkout_error_rate", "checkout_p95_latency"}:
                 dependency = self.telemetry.prometheus_query(
-                    'sum(rate(aegis_dependency_errors_total{service="checkout",'
-                    'dependency="inventory"}[2m]))'
+                    INVENTORY_DEPENDENCY_ERRORS
                 ).get("value")
-                if dependency and dependency > 0.05:
+                if dependency and dependency > DEPENDENCY_ERROR_THRESHOLD:
                     root = "dependency:inventory"
 
             evidence = {
@@ -147,7 +146,6 @@ class IncidentEngine:
                 self.store.add_event(
                     incident["id"], "investigation_started", "Aegis is collecting evidence"
                 )
-                self.store.db.commit()
                 threading.Thread(
                     target=self._investigate,
                     args=(incident["id"],),
@@ -165,7 +163,6 @@ class IncidentEngine:
         except Exception as exc:
             self.store.add_event(incident_id, "agent_error", str(exc))
             self.store.update_incident(incident_id, status="open")
-            self.store.db.commit()
 
     def _resolve_missing(self, fired_ids: set[str]) -> None:
         """Resolve incidents that haven't fired for N cycles."""
@@ -194,5 +191,4 @@ class IncidentEngine:
             self.store.add_event(
                 incident_id, "resolved", "Signals returned below the alert threshold"
             )
-            self.store.db.commit()
             self._misses.pop(incident_id, None)

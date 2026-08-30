@@ -5,9 +5,8 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 from fastapi import FastAPI, Request
@@ -16,6 +15,9 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 from pydantic import BaseModel, Field
 
 from aegis.logging_utils import configure_logging
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
 SERVICE = os.getenv("SERVICE_NAME", "checkout")
 DEPENDENCY_URL = os.getenv("DEPENDENCY_URL", "")
@@ -53,7 +55,9 @@ SIMULATED_REPLICAS = Gauge("aegis_simulated_replicas", "Safe demo scaling contro
 
 
 class FaultState:
-    allowed_faults = {"latency", "errors", "dependency", "cpu"}
+    allowed_faults: ClassVar[frozenset[str]] = frozenset(
+        {"latency", "errors", "dependency", "cpu"}
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -160,7 +164,9 @@ async def metrics() -> Response:
 
 
 @app.middleware("http")
-async def observe(request: Request, call_next):
+async def observe(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     started = time.perf_counter()
     route = request.url.path
@@ -196,8 +202,8 @@ async def healthz() -> dict[str, str]:
     return {"service": SERVICE, "status": "ok"}
 
 
-@app.get("/api/inventory")
-async def inventory() -> dict[str, Any]:
+@app.get("/api/inventory", response_model=None)
+async def inventory() -> dict[str, Any] | JSONResponse:
     if SERVICE != "inventory":
         return JSONResponse({"error": "not an inventory service"}, status_code=404)
     if faults.get("errors") or faults.get("dependency"):
@@ -209,8 +215,8 @@ async def inventory() -> dict[str, Any]:
     return {"sku": "aegis-widget", "available": 42}
 
 
-@app.get("/api/checkout")
-async def checkout() -> dict[str, Any]:
+@app.get("/api/checkout", response_model=None)
+async def checkout() -> dict[str, Any] | JSONResponse:
     if SERVICE != "checkout":
         return JSONResponse({"error": "not a checkout service"}, status_code=404)
     if faults.get("errors"):
