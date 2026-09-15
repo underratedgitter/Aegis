@@ -112,6 +112,15 @@ class TestRateLimiterIsBounded:
             control_plane._check_rate_limit("192.0.2.2")
         assert exc.value.status_code == 429
 
+    def test_http_clients_receive_429_not_500(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_WINDOW", 60)
+        client = TestClient(control_plane.app, raise_server_exceptions=False)
+        codes = [client.get("/healthz").status_code for _ in range(3)]
+        assert codes == [200, 200, 429]
+
     def test_the_window_rolls_forward(self, monkeypatch):
         monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
         monkeypatch.setattr(control_plane, "RATE_LIMIT_WINDOW", 0.05)

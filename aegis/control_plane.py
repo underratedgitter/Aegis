@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from aegis.agent import AgentInvestigator
@@ -159,7 +159,12 @@ async def request_middleware(
     request_id = request.headers.get("X-Request-Id", str(uuid.uuid4())[:8])
     request.state.request_id = request_id
     client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
+    try:
+        _check_rate_limit(client_ip)
+    except HTTPException as exc:
+        # Middleware runs outside FastAPI's exception handlers, so a raised
+        # HTTPException here surfaced as a 500 instead of the intended 429.
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"X-Request-Id": request_id})
     response = await call_next(request)
     response.headers["X-Request-Id"] = request_id
     return response
@@ -276,7 +281,9 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
 
 @app.post("/api/incidents/batch/approve", dependencies=PROTECTED)
 def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
-    incidents = store.list_incidents()
+    # list_incidents sorts open/investigating first, so the default page of 50
+    # could hide pending recommendations behind a burst of new incidents.
+    incidents = store.list_incidents(limit=1000)
     pending = [i for i in incidents if i["status"] == "recommendation_pending"]
     approved = []
     for inc in pending:

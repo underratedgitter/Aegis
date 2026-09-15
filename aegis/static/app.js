@@ -6,7 +6,8 @@ const fmt = (value) => value == null ? "—" : typeof value === "number" ? value
 
 async function getJson(url, options) {
   const response = await fetch(url, options);
-  const payload = await response.json();
+  // A proxy error page or 5xx may not be JSON; keep the HTTP status as the message.
+  const payload = await response.json().catch(() => ({detail: `HTTP ${response.status}`}));
   if (!response.ok) throw new Error(payload.detail || "Request failed");
   return payload;
 }
@@ -25,7 +26,8 @@ async function refresh() {
     const budget = overview.slos?.[0]?.error_budget_remaining;
     $("error-budget").textContent = budget == null ? "—" : `${(budget * 100).toFixed(0)}%`;
     allIncidents = overview.incidents;
-    renderIncidents(allIncidents);
+    // Re-apply the active search/filters; rendering the raw list wiped them every 5s poll.
+    filterIncidents();
     renderMetrics(metrics);
     if (selectedIncident) await showIncident(selectedIncident);
   } catch (error) {
@@ -115,27 +117,31 @@ async function showIncident(id) {
   }
 }
 
-async function investigateIncident(id) {
-  await getJson(`/api/incidents/${id}/investigate`, {method: "POST"});
+// Surface API failures (409 conflict, 401 when AEGIS_API_KEY is set, service down)
+// instead of dropping them as unhandled promise rejections.
+async function runIncidentAction(url, body) {
+  try {
+    await getJson(url, body === undefined ? {method: "POST"} : {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    $("chaos-result").textContent = error.message;
+  }
   await refresh();
+}
+
+async function investigateIncident(id) {
+  await runIncidentAction(`/api/incidents/${id}/investigate`);
 }
 
 async function approveIncident(id) {
-  await getJson(`/api/incidents/${id}/approve`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({approver: "demo-operator"}),
-  });
-  await refresh();
+  await runIncidentAction(`/api/incidents/${id}/approve`, {approver: "demo-operator"});
 }
 
 async function executeIncident(id) {
-  await getJson(`/api/incidents/${id}/execute`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({approver: "demo-operator"}),
-  });
-  await refresh();
+  await runIncidentAction(`/api/incidents/${id}/execute`, {approver: "demo-operator"});
 }
 
 async function batchApprove() {
