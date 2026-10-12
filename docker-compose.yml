@@ -28,7 +28,7 @@ services:
       loki:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz').raise_for_status()"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -52,7 +52,7 @@ services:
     ports:
       - "8080:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz').raise_for_status()"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -75,7 +75,7 @@ services:
     ports:
       - "8081:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz').raise_for_status()"]
       interval: 10s
       timeout: 5s
       retries: 3
