@@ -5,6 +5,21 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
+# Fault injection and remediation are disabled without a shared admin key.
+# Generate a local key once so `make start` keeps the demo usable.
+if [[ -z "${AEGIS_API_KEY:-}" ]]; then
+  if [[ -f .env ]] && grep -q '^AEGIS_API_KEY=.' .env; then
+    AEGIS_API_KEY="$(grep '^AEGIS_API_KEY=' .env | tail -1 | cut -d= -f2-)"
+    export AEGIS_API_KEY
+  else
+    AEGIS_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export AEGIS_API_KEY
+    touch .env
+    printf '\nAEGIS_API_KEY=%s\n' "$AEGIS_API_KEY" >> .env
+    echo "Generated AEGIS_API_KEY in .env; admin/fault endpoints are key-protected."
+  fi
+fi
+
 grafana_port="${GRAFANA_PORT:-3001}"
 open_browser="${OPEN_BROWSER:-1}"
 auto_start_docker="${AUTO_START_DOCKER:-1}"

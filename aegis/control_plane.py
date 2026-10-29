@@ -311,9 +311,19 @@ def audit_log(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
 
 @app.post("/api/chaos", response_model=ChaosResponse, dependencies=PROTECTED)
 def chaos(request: ChaosRequest) -> ChaosResponse:
+    if not API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Fault injection disabled: set AEGIS_API_KEY.",
+        )
     target = {"checkout": settings.checkout_url, "inventory": settings.inventory_url}[request.service]
     try:
-        response = httpx.post(f"{target.rstrip('/')}/admin/faults", json=request.model_dump(exclude={"service"}), timeout=5)
+        response = httpx.post(
+            f"{target.rstrip('/')}/admin/faults",
+            json=request.model_dump(exclude={"service"}),
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=5,
+        )
         response.raise_for_status()
         _audit("chaos_inject", {"service": request.service, "fault": request.fault})
         return ChaosResponse(status="injected", service=request.service, result=response.json())

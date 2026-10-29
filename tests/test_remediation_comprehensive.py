@@ -14,6 +14,7 @@ def settings():
     return Settings(
         checkout_url="http://localhost:8080",
         inventory_url="http://localhost:8081",
+        api_key="test-key",
     )
 
 

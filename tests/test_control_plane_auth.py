@@ -43,12 +43,21 @@ def _call(client, method, path, headers=None):
     return client.post(path, json={}, headers=headers)
 
 
-class TestAuthDisabledByDefault:
-    def test_no_key_configured_leaves_routes_open(self, client, monkeypatch):
-        """The local demo must run with no configuration at all."""
+class TestAuthNotConfigured:
+    def test_read_only_routes_stay_public(self, client, monkeypatch):
+        """The dashboard still renders without a key."""
         monkeypatch.setattr(control_plane, "API_KEY", "")
-        response = client.post("/api/engine/run-once")
-        assert response.status_code != 401
+        assert client.get("/api/incidents").status_code == 200
+
+    def test_fault_injection_is_disabled(self, client, monkeypatch):
+        """Fault injection must fail closed when no admin key exists."""
+        monkeypatch.setattr(control_plane, "API_KEY", "")
+        response = client.post(
+            "/api/chaos",
+            json={"service": "checkout", "fault": "latency"},
+        )
+        assert response.status_code == 503
+        assert "AEGIS_API_KEY" in response.json()["detail"]
 
 
 class TestAuthEnforced:

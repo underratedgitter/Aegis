@@ -3,12 +3,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from urllib.request import Request, urlopen
 
 
-def inject(base_url: str, service: str, fault: str, duration: float, intensity: float) -> None:
+def inject(
+    base_url: str,
+    service: str,
+    fault: str,
+    duration: float,
+    intensity: float,
+    api_key: str,
+) -> None:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = Request(
         f"{base_url.rstrip('/')}/api/chaos",
         data=json.dumps(
@@ -19,7 +30,7 @@ def inject(base_url: str, service: str, fault: str, duration: float, intensity: 
                 "intensity": intensity,
             }
         ).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urlopen(request, timeout=10) as response:
@@ -38,13 +49,25 @@ def main() -> None:
     parser.add_argument(
         "--random", action="store_true", help="keep injecting random bounded incidents"
     )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("AEGIS_API_KEY", ""),
+        help="AEGIS_API_KEY for the control plane and service admin routes",
+    )
     args = parser.parse_args()
     while True:
         service = random.choice(("checkout", "inventory")) if args.random else args.service
         fault = (
             random.choice(("latency", "errors", "dependency", "cpu")) if args.random else args.fault
         )
-        inject(args.base_url, service, fault, args.duration, args.intensity)
+        inject(
+            args.base_url,
+            service,
+            fault,
+            args.duration,
+            args.intensity,
+            args.api_key,
+        )
         if not args.random:
             return
         time.sleep(args.duration + random.uniform(5, 20))

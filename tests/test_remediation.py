@@ -44,7 +44,10 @@ def test_validate_recommendation_rejects_unbounded_or_mismatched_actions(tmp_pat
 def test_execute_uses_the_approved_recommendation_snapshot(tmp_path, monkeypatch):
     db_path = str(tmp_path / "db.sqlite")
     settings = Settings(
-        db_path=db_path, checkout_url="http://checkout", inventory_url="http://inventory"
+        db_path=db_path,
+        checkout_url="http://checkout",
+        inventory_url="http://inventory",
+        api_key="test-key",
     )
     store = Store(db_path)
     incident, _ = store.upsert_incident(
@@ -72,8 +75,8 @@ def test_execute_uses_the_approved_recommendation_snapshot(tmp_path, monkeypatch
 
     calls = []
 
-    def fake_post(url, json, timeout=None):
-        calls.append((url, json))
+    def fake_post(url, json, headers=None, timeout=None):
+        calls.append((url, json, headers))
         return FakeResponse()
 
     executor = RemediationExecutor(settings, store)
@@ -81,4 +84,37 @@ def test_execute_uses_the_approved_recommendation_snapshot(tmp_path, monkeypatch
     result = executor.execute(incident["id"], "operator")
 
     assert result["target"] == "inventory"
-    assert calls == [("http://inventory/admin/faults/clear", {"fault": "dependency"})]
+    assert calls == [
+        (
+            "http://inventory/admin/faults/clear",
+            {"fault": "dependency"},
+            {"Authorization": "Bearer test-key"},
+        )
+    ]
+
+
+def test_execute_requires_admin_key(tmp_path):
+    db_path = str(tmp_path / "db.sqlite")
+    settings = Settings(
+        db_path=db_path,
+        checkout_url="http://checkout",
+        inventory_url="http://inventory",
+    )
+    store = Store(db_path)
+    incident, _ = store.upsert_incident(
+        "inc-no-key", "inventory dependency", "high", "dependency:inventory", {"value": 1}
+    )
+    recommendation = {
+        "action": "clear_fault",
+        "target": "inventory",
+        "parameters": {"fault": "dependency"},
+    }
+    store.update_incident(
+        incident["id"],
+        status="approved",
+        data={"approval": {"recommendation": recommendation}},
+    )
+    executor = RemediationExecutor(settings, store)
+
+    with pytest.raises(RemediationError, match="AEGIS_API_KEY"):
+        executor.execute(incident["id"], "operator")

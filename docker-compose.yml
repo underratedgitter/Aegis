@@ -17,7 +17,7 @@ services:
       - aegis-data:/data
       - aegis-logs:/var/log/aegis
     ports:
-      - "8000:8000"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:8000:8000"
     depends_on:
       checkout:
         condition: service_healthy
@@ -47,10 +47,11 @@ services:
       SERVICE_NAME: checkout
       DEPENDENCY_URL: http://inventory:8000
       LOG_PATH: /var/log/aegis/checkout.jsonl
+      AEGIS_API_KEY: ${AEGIS_API_KEY:-}
     volumes:
       - aegis-logs:/var/log/aegis
     ports:
-      - "8080:8000"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:8080:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz').raise_for_status()"]
       interval: 10s
@@ -70,10 +71,11 @@ services:
     environment:
       SERVICE_NAME: inventory
       LOG_PATH: /var/log/aegis/inventory.jsonl
+      AEGIS_API_KEY: ${AEGIS_API_KEY:-}
     volumes:
       - aegis-logs:/var/log/aegis
     ports:
-      - "8081:8000"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:8081:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/healthz').raise_for_status()"]
       interval: 10s
@@ -97,7 +99,7 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9091:9090"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:9091:9090"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
       interval: 10s
@@ -115,7 +117,7 @@ services:
     image: grafana/loki:3.1.1
     command: -config.file=/etc/loki/local-config.yaml
     ports:
-      - "3100:3100"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:3100:3100"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
       interval: 10s
@@ -148,8 +150,7 @@ services:
   grafana:
     image: grafana/grafana:11.2.0
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SECURITY_ALLOW_EMBEDDING: "true"
     volumes:
@@ -157,7 +158,7 @@ services:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "${AEGIS_BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
     depends_on:
       prometheus:
         condition: service_healthy

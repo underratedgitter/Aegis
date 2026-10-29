@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import threading
 import time
@@ -9,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
@@ -62,6 +63,7 @@ class FaultState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._faults: dict[str, dict[str, float]] = {}
+        self._stop_events: dict[str, threading.Event] = {}
 
     def inject(self, fault: str, duration: float, intensity: float) -> dict[str, Any]:
         if fault not in self.allowed_faults:
@@ -69,13 +71,26 @@ class FaultState:
         duration = min(900.0, max(1.0, float(duration)))
         intensity = min(10.0, max(0.1, float(intensity)))
         until = time.time() + duration
+        stop_event: threading.Event | None = None
         with self._lock:
+            if fault == "cpu":
+                # A new CPU injection replaces the old burner instead of adding
+                # another thread that would keep loading the host.
+                previous = self._stop_events.get("cpu")
+                if previous:
+                    previous.set()
+                stop_event = threading.Event()
+                self._stop_events["cpu"] = stop_event
             self._faults[fault] = {"until": until, "intensity": intensity}
         FAULT_ACTIVE.labels(SERVICE, fault).set(1)
         FAULT_EVENTS.labels(SERVICE, fault).inc()
         if fault == "cpu":
             CPU_BURN_ACTIVE.labels(SERVICE).set(1)
-            threading.Thread(target=self._burn_cpu, args=(until, intensity), daemon=True).start()
+            threading.Thread(
+                target=self._burn_cpu, args=(until, intensity, stop_event), daemon=True
+            ).start()
+        # Expire the state and gauge even when nobody polls the admin endpoint.
+        threading.Thread(target=self._expire, args=(fault, until), daemon=True).start()
         return {
             "fault": fault,
             "duration_seconds": duration,
@@ -84,6 +99,7 @@ class FaultState:
         }
 
     def clear(self, fault: str | None = None) -> None:
+        stop_events: list[threading.Event] = []
         with self._lock:
             if fault is None:
                 keys = list(self._faults)
@@ -94,19 +110,33 @@ class FaultState:
             for key in keys:
                 self._faults.pop(key, None)
                 FAULT_ACTIVE.labels(SERVICE, key).set(0)
+                if key == "cpu":
+                    event = self._stop_events.pop("cpu", None)
+                    if event:
+                        stop_events.append(event)
+        for event in stop_events:
+            event.set()
         if fault in (None, "cpu"):
             CPU_BURN_ACTIVE.labels(SERVICE).set(0)
 
     def get(self, fault: str) -> dict[str, float] | None:
+        expired = False
         with self._lock:
             state = self._faults.get(fault)
             if state and state["until"] <= time.time():
                 self._faults.pop(fault, None)
-                FAULT_ACTIVE.labels(SERVICE, fault).set(0)
                 if fault == "cpu":
-                    CPU_BURN_ACTIVE.labels(SERVICE).set(0)
-                return None
-            return state.copy() if state else None
+                    event = self._stop_events.pop("cpu", None)
+                    if event:
+                        event.set()
+                expired = True
+                state = None
+            result = state.copy() if state else None
+        if expired:
+            FAULT_ACTIVE.labels(SERVICE, fault).set(0)
+            if fault == "cpu":
+                CPU_BURN_ACTIVE.labels(SERVICE).set(0)
+        return result
 
     def snapshot(self) -> dict[str, dict[str, float]]:
         return {
@@ -115,11 +145,30 @@ class FaultState:
             if (state := self.get(fault))
         }
 
+    def _expire(self, fault: str, until: float) -> None:
+        delay = until - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        with self._lock:
+            state = self._faults.get(fault)
+            if not state or state["until"] != until:
+                return
+            self._faults.pop(fault, None)
+            if fault == "cpu":
+                event = self._stop_events.pop("cpu", None)
+                if event:
+                    event.set()
+        FAULT_ACTIVE.labels(SERVICE, fault).set(0)
+        if fault == "cpu":
+            CPU_BURN_ACTIVE.labels(SERVICE).set(0)
+
     @staticmethod
-    def _burn_cpu(until: float, intensity: float) -> None:
+    def _burn_cpu(until: float, intensity: float, stop_event: threading.Event) -> None:
         # A bounded, intentionally boring CPU burner keeps the chaos demo self-contained.
-        while time.time() < until:
-            for _ in range(max(1, int(50_000 * max(0.1, intensity)))):
+        while time.time() < until and not stop_event.is_set():
+            for iteration in range(max(1, int(50_000 * max(0.1, intensity)))):
+                if iteration % 1024 == 0 and stop_event.is_set():
+                    return
                 _ = 17 * 31
 
 
@@ -145,6 +194,25 @@ class ScaleRequest(BaseModel):
 def _fault_latency() -> float:
     state = faults.get("latency")
     return float(state["intensity"]) if state else 0.0
+
+
+def require_admin_key(request: Request) -> None:
+    """Require the shared admin key before any fault or scale control."""
+    expected = os.getenv("AEGIS_API_KEY", "")
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin API disabled: set AEGIS_API_KEY to enable fault injection.",
+        )
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and hmac.compare_digest(
+        auth_header[7:], expected
+    ):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+ADMIN = [Depends(require_admin_key)]
 
 
 @asynccontextmanager
@@ -257,12 +325,12 @@ async def checkout() -> dict[str, Any] | JSONResponse:
     return {"order_id": str(uuid.uuid4()), "status": "confirmed", "service": SERVICE}
 
 
-@app.get("/admin/faults")
+@app.get("/admin/faults", dependencies=ADMIN)
 async def get_faults() -> dict[str, Any]:
     return {"service": SERVICE, "faults": faults.snapshot()}
 
 
-@app.post("/admin/faults")
+@app.post("/admin/faults", dependencies=ADMIN)
 async def inject_fault(payload: FaultRequest) -> dict[str, Any]:
     return {
         "service": SERVICE,
@@ -270,7 +338,7 @@ async def inject_fault(payload: FaultRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/admin/faults/clear")
+@app.post("/admin/faults/clear", dependencies=ADMIN)
 async def clear_fault(payload: FaultClearRequest | None = None) -> dict[str, Any]:
     fault = payload.fault if payload else None
     faults.clear(fault)
@@ -280,7 +348,7 @@ async def clear_fault(payload: FaultClearRequest | None = None) -> dict[str, Any
     return {"service": SERVICE, "faults": faults.snapshot(), "status": "cleared"}
 
 
-@app.post("/admin/scale")
+@app.post("/admin/scale", dependencies=ADMIN)
 async def scale_simulation(payload: ScaleRequest) -> dict[str, Any]:
     global SIMULATED_REPLICA_COUNT
     replicas = payload.replicas

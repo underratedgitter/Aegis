@@ -73,10 +73,16 @@ class RemediationExecutor:
             payload = {"replicas": replicas}
             endpoint = "/admin/scale"
 
+        if not self.settings.api_key:
+            raise RemediationError(
+                "AEGIS_API_KEY is required before remediation can call the service admin API"
+            )
+
         try:
             response = self._client.post(
                 f"{self.targets[target].rstrip('/')}{endpoint}",
                 json=payload,
+                headers={"Authorization": f"Bearer {self.settings.api_key}"},
             )
             response.raise_for_status()
             result = response.json()

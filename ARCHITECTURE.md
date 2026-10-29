@@ -118,7 +118,7 @@ stateDiagram-v2
 | **SQL Injection** | Parameterized queries throughout `storage.py` |
 | **Path Traversal** | `Path(slug).name` in `_read_runbook()` |
 | **Timing Attacks** | `hmac.compare_digest()` for API key comparison |
-| **Auth on state changes** | `AEGIS_API_KEY`, when set, guards every mutating control-plane route |
+| **Auth on state changes** | `AEGIS_API_KEY` guards every mutating control-plane route; demo `/admin/*` routes require the same key and fail closed when it is unset |
 | **Bounded memory** | Audit buffer and rate-limit buckets are capped and evicted |
 | **Input Validation** | Pydantic models with regex patterns for fault types |
 | **Remediation Safety** | Allowlist-based actions, no shell/Docker access |
@@ -129,7 +129,8 @@ stateDiagram-v2
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| **Demo services' `/admin/*` are unauthenticated** | Medium | Only reachable inside the Compose network; add auth before exposing them |
+| **Demo services' `/admin/*` require an API key** | Mitigated | `AEGIS_API_KEY` is required; Compose publishes all ports on `127.0.0.1` by default |
+| **Grafana anonymous admin** | Fixed | Anonymous access is disabled and Grafana binds to loopback by default |
 | **CORS allows `*`** | Low (demo) | Credentials are disabled, so cookies are never sent cross-origin; restrict origins for production |
 | **In-memory rate limiting** | Low (single instance) | Use Redis for multi-instance deployments |
 | **No HTTPS enforcement** | Low | Handle at reverse proxy (nginx/traefik) |
@@ -142,7 +143,7 @@ stateDiagram-v2
 
 ### 🛡️ Security Recommendations
 
-1. **Enable API key auth** — Set `AEGIS_API_KEY`; the control room UI does not send the header, so drive the API directly when it is on
+1. **Keep the API key set** — `make start` generates `AEGIS_API_KEY` in `.env`; set it explicitly for direct `docker compose` runs. The control room UI does not send the header, so drive authenticated mutations directly
 2. **Restrict CORS** — Set `CORS_ORIGINS=https://your-domain.com`
 3. **Add request body limits** — Prevent large payload attacks
 4. **Persist audit log** — Store in SQLite for compliance
