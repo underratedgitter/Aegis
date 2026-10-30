@@ -5,8 +5,15 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
+from pathlib import Path
 from urllib.request import Request, urlopen
+
+# Allow `python3 scripts/chaos.py` from a checkout without installing the package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from aegis.auth import bearer_header
 
 
 def inject(
@@ -18,8 +25,8 @@ def inject(
     api_key: str,
 ) -> None:
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    if api_key.strip():
+        headers.update(bearer_header(api_key))
     request = Request(
         f"{base_url.rstrip('/')}/api/chaos",
         data=json.dumps(

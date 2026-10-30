@@ -165,7 +165,14 @@ class IncidentEngine:
             self.store.update_incident(incident_id, status="open")
 
     def _resolve_missing(self, fired_ids: set[str]) -> None:
-        """Resolve incidents that haven't fired for N cycles."""
+        """Resolve incidents that haven't fired for N cycles.
+
+        Auto-resolution only applies to incidents that are still ``open`` and
+        have not entered the investigation/approval pipeline. Missing signals
+        during ``investigating``, ``recommendation_pending``, or ``approved``
+        do not mean remediation finished; resolving there would close the
+        incident before the operator-approved action runs.
+        """
         active = self.store.list_incidents()
         active_ids = {
             incident["id"]
@@ -178,12 +185,26 @@ class IncidentEngine:
                 self._misses[incident_id] = 0
                 continue
 
+            incident = self.store.get_incident(incident_id)
+            if not incident or incident["status"] in {"resolved", "closed"}:
+                self._misses.pop(incident_id, None)
+                continue
+
+            if incident["status"] != "open":
+                # Clear accumulated misses so a post-remediation incident gets
+                # a full resolution window after it returns to ``open``.
+                self._misses.pop(incident_id, None)
+                continue
+
             self._misses[incident_id] = self._misses.get(incident_id, 0) + 1
             if self._misses[incident_id] < self.settings.resolution_cycles:
                 continue
 
+            # Re-check after the threshold: the status may have advanced since
+            # the snapshot above (e.g. an investigation completing in another thread).
             incident = self.store.get_incident(incident_id)
-            if not incident or incident["status"] in {"resolved", "closed"}:
+            if not incident or incident["status"] != "open":
+                self._misses.pop(incident_id, None)
                 continue
 
             resolved_at = utc_now()

@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from aegis.agent import AgentInvestigator
+from aegis.auth import bearer_header
 from aegis.incidents import IncidentEngine
 from aegis.models import (
     ApprovalRequest,
@@ -311,7 +312,7 @@ def audit_log(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
 
 @app.post("/api/chaos", response_model=ChaosResponse, dependencies=PROTECTED)
 def chaos(request: ChaosRequest) -> ChaosResponse:
-    if not API_KEY:
+    if not API_KEY.strip():
         raise HTTPException(
             status_code=503,
             detail="Fault injection disabled: set AEGIS_API_KEY.",
@@ -321,7 +322,7 @@ def chaos(request: ChaosRequest) -> ChaosResponse:
         response = httpx.post(
             f"{target.rstrip('/')}/admin/faults",
             json=request.model_dump(exclude={"service"}),
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers=bearer_header(API_KEY),
             timeout=5,
         )
         response.raise_for_status()
