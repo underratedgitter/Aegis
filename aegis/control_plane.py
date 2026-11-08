@@ -232,6 +232,27 @@ def export_incidents(
     return {"incidents": incidents, "exported_at": utc_now(), "count": len(incidents)}
 
 
+@app.post("/api/incidents/batch/approve", dependencies=PROTECTED)
+def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
+    # list_incidents sorts open/investigating first, so the default page of 50
+    # could hide pending recommendations behind a burst of new incidents.
+    incidents = store.list_incidents(limit=1000)
+    pending = [i for i in incidents if i["status"] == "recommendation_pending"]
+    approved = []
+    for inc in pending:
+        rec = inc["data"].get("recommendation") or {}
+        try:
+            remediation.validate_recommendation(rec)
+        except RemediationError:
+            continue
+        data = {**inc["data"], "approval": {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}}
+        store.update_incident(inc["id"], status="approved", data=data)
+        store.add_event(inc["id"], "approval", f"Batch approval from {request.approver}", data["approval"])
+        approved.append(inc["id"])
+    _audit("batch_approve", {"approver": request.approver, "count": len(approved)})
+    return {"approved": approved, "count": len(approved)}
+
+
 @app.get("/api/incidents/{incident_id}")
 def get_incident(incident_id: str) -> dict[str, Any]:
     incident = store.get_incident(incident_id)
@@ -278,27 +299,6 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     _audit("execute", {"incident_id": incident_id, "approver": request.approver})
     return ExecuteResponse(**result)
-
-
-@app.post("/api/incidents/batch/approve", dependencies=PROTECTED)
-def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
-    # list_incidents sorts open/investigating first, so the default page of 50
-    # could hide pending recommendations behind a burst of new incidents.
-    incidents = store.list_incidents(limit=1000)
-    pending = [i for i in incidents if i["status"] == "recommendation_pending"]
-    approved = []
-    for inc in pending:
-        rec = inc["data"].get("recommendation") or {}
-        try:
-            remediation.validate_recommendation(rec)
-        except RemediationError:
-            continue
-        data = {**inc["data"], "approval": {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}}
-        store.update_incident(inc["id"], status="approved", data=data)
-        store.add_event(inc["id"], "approval", f"Batch approval from {request.approver}", data["approval"])
-        approved.append(inc["id"])
-    _audit("batch_approve", {"approver": request.approver, "count": len(approved)})
-    return {"approved": approved, "count": len(approved)}
 
 
 # ─── Audit Log ────────────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 """Tests that the bearer-token guard is actually enforced on state-changing routes."""
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -85,3 +87,48 @@ class TestAuthEnforced:
     @pytest.mark.parametrize("method,path", PUBLIC_ROUTES)
     def test_read_only_routes_stay_public(self, client, with_api_key, method, path):
         assert _call(client, method, path).status_code == 200
+
+
+class TestBatchApproveRouting:
+    def test_batch_approve_is_not_shadowed_by_incident_id_route(self, client, with_api_key):
+        """/batch/approve must not be captured as incident_id="batch" (404)."""
+        recommendation = {
+            "action": "clear_fault",
+            "target": "checkout",
+            "parameters": {"fault": "latency"},
+        }
+        incident, _ = control_plane.store.upsert_incident(
+            "inc-batch-1", "Batch", "high", "service:batch", {"rule": "r"}
+        )
+        control_plane.store.update_incident(
+            incident["id"],
+            status="recommendation_pending",
+            data={**incident["data"], "recommendation": recommendation},
+        )
+
+        response = client.post(
+            "/api/incidents/batch/approve",
+            json={"approver": "tester"},
+            headers={"Authorization": f"Bearer {with_api_key}"},
+        )
+
+        assert response.status_code != 404
+        assert response.status_code == 200
+        assert "inc-batch-1" in response.json()["approved"]
+        assert control_plane.store.get_incident("inc-batch-1")["status"] == "approved"
+
+
+class TestWebUiSendsKey:
+    """The UI has no JS test harness, so check the shipped script statically."""
+
+    APP_JS = (Path(control_plane.__file__).parent / "static" / "app.js").read_text()
+
+    def test_write_calls_send_bearer_header(self):
+        assert "Authorization = `Bearer ${key}`" in self.APP_JS
+        # Every POST goes through postOptions, which attaches the header.
+        assert self.APP_JS.count('method: "POST"') == 1
+        assert self.APP_JS.count("postOptions(") >= 4
+
+    def test_key_is_kept_out_of_urls_and_persistent_storage(self):
+        assert "localStorage" not in self.APP_JS
+        assert "sessionStorage" in self.APP_JS

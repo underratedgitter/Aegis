@@ -4,8 +4,37 @@ let allIncidents = [];
 const $ = (id) => document.getElementById(id);
 const fmt = (value) => value == null ? "—" : typeof value === "number" ? value.toFixed(value < 1 ? 3 : 1) : value;
 
+// The key lives only in sessionStorage; storage can be blocked, so never let it throw.
+function getApiKey() {
+  try {
+    return sessionStorage.getItem("aegis-api-key") || "";
+  } catch {
+    return "";
+  }
+}
+
+function saveApiKey() {
+  const key = $("api-key").value.trim();
+  try {
+    if (key) sessionStorage.setItem("aegis-api-key", key);
+    else sessionStorage.removeItem("aegis-api-key");
+  } catch {
+    $("chaos-result").textContent = "Could not store the API key in this browser.";
+  }
+}
+
+// Options for a state-changing POST; sends the bearer key when one is set.
+function postOptions(body) {
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const key = getApiKey();
+  if (key) headers.Authorization = `Bearer ${key}`;
+  return {method: "POST", headers, body: body === undefined ? undefined : JSON.stringify(body)};
+}
+
 async function getJson(url, options) {
   const response = await fetch(url, options);
+  if (response.status === 401) throw new Error("API key required: enter the AEGIS_API_KEY in the API key box above and retry.");
   // A proxy error page or 5xx may not be JSON; keep the HTTP status as the message.
   const payload = await response.json().catch(() => ({detail: `HTTP ${response.status}`}));
   if (!response.ok) throw new Error(payload.detail || "Request failed");
@@ -121,11 +150,7 @@ async function showIncident(id) {
 // instead of dropping them as unhandled promise rejections.
 async function runIncidentAction(url, body) {
   try {
-    await getJson(url, body === undefined ? {method: "POST"} : {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(body),
-    });
+    await getJson(url, postOptions(body));
   } catch (error) {
     $("chaos-result").textContent = error.message;
   }
@@ -146,11 +171,7 @@ async function executeIncident(id) {
 
 async function batchApprove() {
   try {
-    const result = await getJson("/api/incidents/batch/approve", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({approver: "demo-operator"}),
-    });
+    const result = await getJson("/api/incidents/batch/approve", postOptions({approver: "demo-operator"}));
     $("chaos-result").textContent = `Approved ${result.count} incident(s).`;
     await refresh();
   } catch (error) {
@@ -172,11 +193,7 @@ $("inject").onclick = async () => {
       duration_seconds: Number($("chaos-duration").value),
       intensity: $("chaos-fault").value === "latency" ? 1.2 : 1,
     };
-    await getJson("/api/chaos", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
+    await getJson("/api/chaos", postOptions(payload));
     result.textContent = "Fault injected. Engine will evaluate within a few seconds.";
     setTimeout(refresh, 1500);
   } catch (error) {
@@ -185,6 +202,9 @@ $("inject").onclick = async () => {
 };
 
 $("refresh").onclick = refresh;
+
+$("api-key").value = getApiKey();
+$("api-key").addEventListener("change", saveApiKey);
 
 // Filter event listeners
 $("incident-search")?.addEventListener("input", filterIncidents);
