@@ -15,6 +15,7 @@ It is deliberately runnable without an API key. Local fallback mode performs the
 | Start here | Link |
 |---|---|
 | Control room | <http://localhost:8000> |
+| API documentation | <http://localhost:8000/docs> |
 | Grafana signals | <http://localhost:3001> or <http://localhost:3002> |
 | Quick demo | [Run Aegis](#run-aegis) |
 | Safety model | [Human-approved remediation](#safety-model-and-design-decisions) |
@@ -59,7 +60,7 @@ and opens the local pages automatically. Published ports bind to `127.0.0.1` by 
 `AEGIS_BIND_ADDR` to change that.
 
 - Aegis control room: <http://localhost:8000>
-- Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied)
+- Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied; default credentials: `admin` / `admin`)
 - Prometheus: <http://localhost:9091>
 - Checkout: <http://localhost:8080>
 - Inventory: <http://localhost:8081>
@@ -85,6 +86,8 @@ The control room is the recommended demo surface. If you want traffic before inj
 python3 scripts/smoke.py --count 100
 ```
 
+`scripts/smoke.py` defaults to `--checkout-url http://localhost:8080` and `--count 20`.
+
 Or inject a failure from a terminal, passing the key from `.env`:
 
 ```bash
@@ -92,7 +95,7 @@ export AEGIS_API_KEY="$(grep '^AEGIS_API_KEY=' .env | tail -1 | cut -d= -f2-)"
 python3 scripts/chaos.py --service inventory --fault dependency --duration 60
 ```
 
-`chaos.py` reads `AEGIS_API_KEY` from the environment (or `--api-key`). Faults are `latency`, `errors`, `dependency`, and `cpu`; `--duration` is 1–900 seconds and `--intensity` is 0.1–10. `make chaos` runs the example above.
+`chaos.py` reads `AEGIS_API_KEY` from the environment (or `--api-key`). Faults are `latency`, `errors`, `dependency`, and `cpu`; `--duration` is 1–900 seconds and `--intensity` is 0.1–10. Pass `--random` to keep injecting random bounded incidents. `make chaos` runs the single-fault example above (using the exported `AEGIS_API_KEY`).
 
 Wait for the incident engine to detect the failure. The expected flow is:
 
@@ -148,7 +151,9 @@ The dashboard is the best place to watch the workflow, while Grafana provides th
 
 ## Useful API calls
 
-Read endpoints are open. State-changing endpoints (`POST` routes and `GET /api/audit`) require `Authorization: Bearer $AEGIS_API_KEY` whenever a key is configured; the examples below assume the key is exported as in [Run Aegis](#run-aegis). Interactive API docs are served at <http://localhost:8000/docs>.
+Read endpoints are open. State-changing endpoints (`POST` routes and `GET /api/audit`) require `Authorization: Bearer $AEGIS_API_KEY` whenever a key is configured; the examples below assume the key is exported as in [Run Aegis](#run-aegis). Interactive API docs are served at <http://localhost:8000/docs> (with ReDoc at <http://localhost:8000/redoc>).
+
+### Control plane
 
 ```bash
 # Liveness and current state
@@ -164,6 +169,10 @@ curl http://localhost:8000/api/incidents
 curl http://localhost:8000/api/incidents/<incident-id>
 curl 'http://localhost:8000/api/incidents/export?format=csv'
 
+# Trigger investigation manually
+curl -X POST http://localhost:8000/api/incidents/<incident-id>/investigate \
+  -H "Authorization: Bearer $AEGIS_API_KEY"
+
 # The UI normally performs these two calls after investigation
 curl -X POST http://localhost:8000/api/incidents/<incident-id>/approve \
   -H "Authorization: Bearer $AEGIS_API_KEY" \
@@ -173,7 +182,28 @@ curl -X POST http://localhost:8000/api/incidents/<incident-id>/execute \
   -H 'content-type: application/json' -d '{"approver":"demo-operator"}'
 ```
 
-Other routes: `POST /api/incidents/<id>/investigate`, `POST /api/incidents/batch/approve`, `POST /api/chaos`, `GET /api/audit`, `GET /api/metrics`, `GET /api/logs`, and `GET /api/runbooks`. The control plane rate-limits each client (default 100 requests per 60 seconds; `AEGIS_RATE_LIMIT_MAX`, `AEGIS_RATE_LIMIT_WINDOW`).
+Other control-plane routes:
+- `POST /api/incidents/batch/approve` (requires key): Batch-approve all incidents in `recommendation_pending`.
+- `POST /api/chaos` (requires key): Inject bounded faults into demo services (`service`, `fault`, `duration_seconds`, `intensity`).
+- `GET /api/audit` (requires key): Recent audit trail entries (`?limit=50`).
+- `GET /api/metrics`: Current Prometheus metric snapshot for checkout/inventory.
+- `GET /api/logs`: Recent structured JSON logs (`?service=checkout|inventory&limit=40`).
+- `GET /api/runbooks`: Available incident runbooks from `runbooks/`.
+
+The control plane rate-limits each client (default 100 requests per 60 seconds; configurable via `AEGIS_RATE_LIMIT_MAX` and `AEGIS_RATE_LIMIT_WINDOW`).
+
+### Demo services (Checkout & Inventory)
+
+Each demo service also exposes its own application and admin endpoints:
+
+- `GET /healthz` — Service liveness check.
+- `GET /metrics` — Prometheus metrics scrape target.
+- `GET /api/checkout` (Checkout: port 8080) — Process an order and call the inventory dependency.
+- `GET /api/inventory` (Inventory: port 8081) — Check inventory availability for the demo SKU.
+- `GET /admin/faults` (requires key) — View currently active faults on the service.
+- `POST /admin/faults` (requires key) — Direct fault injection (`fault`, `duration_seconds`, `intensity`).
+- `POST /admin/faults/clear` (requires key) — Clear active faults (`{"fault": "<fault_name>"}` or empty for all).
+- `POST /admin/scale` (requires key) — Set simulated replica gauge (`{"replicas": 1..3}`).
 
 ## Local development
 
@@ -186,9 +216,22 @@ ruff check aegis tests scripts
 mypy aegis --ignore-missing-imports
 ```
 
-`make test`, `make lint`, `make format`, and `make typecheck` wrap the same tools; CI (`.github/workflows/tests.yml`) runs lint, type-check, and tests on Python 3.11–3.13.
+`make test`, `make test-cov`, `make lint`, `make format`, and `make typecheck` wrap the same tools; CI (`.github/workflows/tests.yml`) runs lint, type-check, and the test suite across Python 3.11–3.13.
 
-Run a service locally with `SERVICE_NAME=inventory PORT=8081 python3 -m aegis.service_main` (set `DEPENDENCY_URL` on `checkout` to point at inventory) or run the control plane with `python3 -m aegis.control_main`. Both listen on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL`, `CHECKOUT_URL`, `INVENTORY_URL`, `AEGIS_DB_PATH`, `AEGIS_LOG_DIR`, `AEGIS_RUNBOOK_DIR`, `AEGIS_POLL_SECONDS`, and `AEGIS_API_KEY`; see `aegis/settings.py`. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
+To run the services locally without Docker:
+
+```bash
+# Terminal 1: inventory service
+SERVICE_NAME=inventory PORT=8081 python3 -m aegis.service_main
+
+# Terminal 2: checkout service (points to inventory on 8081)
+PORT=8080 DEPENDENCY_URL=http://localhost:8081 python3 -m aegis.service_main
+
+# Terminal 3: control plane (listens on default PORT 8000)
+python3 -m aegis.control_main
+```
+
+Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), and `AEGIS_API_KEY`; see `aegis/settings.py`. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
 
 ## Safety model and design decisions
 
