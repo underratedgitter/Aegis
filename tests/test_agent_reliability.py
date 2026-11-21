@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -61,9 +62,9 @@ def _response(content=None, tool_calls=None):
 class FakeOpenAI:
     """Replays scripted responses; a scripted exception is raised instead."""
 
-    script: list = []
-    init_kwargs: dict = {}
-    requests: list = []
+    script: ClassVar[list] = []
+    init_kwargs: ClassVar[dict] = {}
+    requests: ClassVar[list] = []
 
     def __init__(self, **kwargs):
         FakeOpenAI.init_kwargs = kwargs

@@ -50,7 +50,7 @@ def test_one_rule_raising_does_not_stop_the_others(tmp_path):
             INVENTORY_DEPENDENCY_ERRORS: {"value": 1.0},
         }
     )
-    engine, store = _engine(tmp_path, telemetry)
+    engine, _ = _engine(tmp_path, telemetry)
 
     fired = engine.run_once()
 

@@ -1,5 +1,7 @@
 """Prometheus calls time out, retry transient failures with backoff, and fail fast during an outage."""
 
+from typing import ClassVar
+
 import httpx
 import pytest
 
@@ -34,7 +36,7 @@ def _response(status, payload=None):
 def clock(monkeypatch):
     class Clock:
         now = 1000.0
-        sleeps: list[float] = []
+        sleeps: ClassVar[list[float]] = []
 
     monkeypatch.setattr(telemetry_module.time, "sleep", lambda seconds: Clock.sleeps.append(seconds))
     monkeypatch.setattr(telemetry_module.time, "monotonic", lambda: Clock.now)

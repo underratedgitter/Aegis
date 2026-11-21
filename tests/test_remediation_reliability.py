@@ -74,7 +74,7 @@ def test_failed_execute_records_an_event_saying_whether_it_may_have_applied(
 
 
 def test_server_rejection_is_recorded_as_not_applied(tmp_path, monkeypatch):
-    executor, store = _executor(tmp_path)
+    executor, _ = _executor(tmp_path)
 
     class Rejected:
         def raise_for_status(self):
