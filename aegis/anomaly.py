@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from math import sqrt
+from math import isfinite, sqrt
 from statistics import mean
 
 from aegis.models import AnomalyResult
@@ -38,6 +38,10 @@ class RollingZScoreDetector:
         Returns:
             AnomalyResult with value, baseline, z-score, and anomaly flag.
         """
+        if not isfinite(value):
+            # One NaN or infinity would poison the mean and stddev for a whole window.
+            return AnomalyResult(value=value, baseline=None, z_score=None, anomalous=False)
+
         history = self.samples.setdefault(key, deque(maxlen=self.window))
         baseline: float | None = None
         z_score: float | None = None
