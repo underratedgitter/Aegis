@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from collections.abc import Collection
 
 BUSY_TIMEOUT_MS = 10_000
+# Recent detected/signal events inspected when deciding whether another one is due.
+SIGNAL_LOOKBACK = 200
 
 
 def utc_now() -> str:
@@ -23,9 +25,12 @@ def utc_now() -> str:
 class Store:
     """Thread-safe SQLite storage for incidents and events."""
 
-    def __init__(self, path: str, max_evidence: int = 100):
+    def __init__(
+        self, path: str, max_evidence: int = 100, signal_event_interval: float = 60.0
+    ):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.max_evidence = max(1, max_evidence)  # [-0:] would keep everything
+        self.signal_event_interval = max(0.0, signal_event_interval)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(
             path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000
@@ -149,10 +154,11 @@ class Store:
                     "UPDATE incidents SET last_seen = ?, data_json = ? WHERE id = ?",
                     (now, json.dumps(merged), existing["id"]),
                 )
-                self.add_event(
-                    existing["id"], "signal", f"Signal still active: {title}", evidence,
-                    commit=False,
-                )
+                if self._signal_event_due(existing["id"], evidence, now):
+                    self.add_event(
+                        existing["id"], "signal", f"Signal still active: {title}", evidence,
+                        commit=False,
+                    )
                 self.db.commit()
                 return self.get_incident(existing["id"]) or existing, False
 
@@ -167,6 +173,27 @@ class Store:
             )
             self.db.commit()
             return self.get_incident(incident_id) or {}, True
+
+    def _signal_event_due(self, incident_id: str, evidence: dict[str, Any], now: str) -> bool:
+        """Whether a still-active signal deserves a timeline event.
+
+        Evidence is appended on every poll, but the timeline only gets an event when
+        this rule has not been recorded for the incident yet (a state change) or its
+        last event is at least `signal_event_interval` seconds old. The check reads
+        the stored events, so it holds across restarts.
+        """
+        rule = evidence.get("rule")
+        rows = self.db.execute(
+            "SELECT at, data_json FROM events WHERE incident_id = ? "
+            "AND kind IN ('detected', 'signal') ORDER BY id DESC LIMIT ?",
+            (incident_id, SIGNAL_LOOKBACK),
+        ).fetchall()
+        for row in rows:
+            if json.loads(row["data_json"] or "{}").get("rule") != rule:
+                continue
+            elapsed = datetime.fromisoformat(now) - datetime.fromisoformat(row["at"])
+            return elapsed.total_seconds() >= self.signal_event_interval
+        return True
 
     def update_incident(self, incident_id: str, **fields: Any) -> dict[str, Any] | None:
         """Update incident fields."""

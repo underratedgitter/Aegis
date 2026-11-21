@@ -76,6 +76,7 @@ class TestFailFastValidation:
             "AEGIS_POLL_SECONDS",
             "AEGIS_MAX_EVIDENCE",
             "AEGIS_RESOLUTION_CYCLES",
+            "AEGIS_SIGNAL_EVENT_INTERVAL",
             "AEGIS_RATE_LIMIT_MAX",
             "AEGIS_RATE_LIMIT_WINDOW",
             "AEGIS_AUTH_FAIL_MAX",
@@ -87,6 +88,17 @@ class TestFailFastValidation:
     def test_malformed_integer_names_the_variable(self, monkeypatch, name):
         monkeypatch.setenv(name, "soon")
         with pytest.raises(SettingsError, match=f"{name} must be an integer, got 'soon'"):
+            Settings()
+
+    def test_signal_event_interval_defaults_to_a_minute_and_allows_zero(self, monkeypatch):
+        monkeypatch.delenv("AEGIS_SIGNAL_EVENT_INTERVAL", raising=False)
+        assert Settings().signal_event_interval == 60
+        monkeypatch.setenv("AEGIS_SIGNAL_EVENT_INTERVAL", "0")
+        assert Settings().signal_event_interval == 0
+
+    def test_negative_signal_event_interval_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("AEGIS_SIGNAL_EVENT_INTERVAL", "-1")
+        with pytest.raises(SettingsError, match="AEGIS_SIGNAL_EVENT_INTERVAL must be at least 0"):
             Settings()
 
     @pytest.mark.parametrize("value", ["0", "-5"])

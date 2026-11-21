@@ -60,7 +60,9 @@ if TYPE_CHECKING:
 logger = configure_logging("aegis-control-plane")
 settings = Settings()
 settings.ensure_dirs()
-store = Store(settings.db_path, settings.max_evidence_history)
+store = Store(
+    settings.db_path, settings.max_evidence_history, settings.signal_event_interval
+)
 telemetry = Telemetry(settings)
 engine = IncidentEngine(settings, store, telemetry)
 agent = AgentInvestigator(settings, store, telemetry)

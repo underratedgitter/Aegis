@@ -90,6 +90,7 @@ class Settings:
     poll_seconds: int = _env_int("AEGIS_POLL_SECONDS", 5)
     max_evidence_history: int = _env_int("AEGIS_MAX_EVIDENCE", 100)
     resolution_cycles: int = _env_int("AEGIS_RESOLUTION_CYCLES", 2)
+    signal_event_interval: int = _env_int("AEGIS_SIGNAL_EVENT_INTERVAL", 60)
 
     # LLM
     openai_model: str = _env("OPENAI_MODEL", "gpt-4.1-mini")
@@ -114,6 +115,7 @@ class Settings:
             "AEGIS_POLL_SECONDS": ("poll_seconds", 1),
             "AEGIS_MAX_EVIDENCE": ("max_evidence_history", 1),
             "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", 1),
+            "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", 0),
             "AEGIS_RATE_LIMIT_WINDOW": ("rate_limit_window", 1),
             "AEGIS_RATE_LIMIT_MAX": ("rate_limit_max", 1),
             "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", 1),
