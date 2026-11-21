@@ -32,7 +32,11 @@ class ScriptedTelemetry:
 
 
 def _engine(tmp_path, telemetry, **settings):
-    config = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks", **settings)
+    config = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    # Settings validates at construction; the engine must still survive values that
+    # slip past it (e.g. a zero poll interval), so the overrides bypass validation.
+    for name, value in settings.items():
+        object.__setattr__(config, name, value)
     store = Store(config.db_path)
     engine = IncidentEngine(config, store, telemetry)
     engine._investigate = lambda incident_id: None

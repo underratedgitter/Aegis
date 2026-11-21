@@ -129,7 +129,10 @@ def test_non_json_body_becomes_an_error_result(telemetry, clock, monkeypatch):
 
 
 def test_malformed_prometheus_url_is_an_error_result(clock):
-    instance = Telemetry(Settings(prometheus_url="http://bad host:99999", log_dir="./logs"))
+    config = Settings(log_dir="./logs")
+    # Settings rejects malformed URLs at startup; Telemetry must still not raise if one slips through.
+    object.__setattr__(config, "prometheus_url", "http://bad host:99999")
+    instance = Telemetry(config)
     try:
         result = instance.prometheus_query("up")
         assert result["value"] is None
