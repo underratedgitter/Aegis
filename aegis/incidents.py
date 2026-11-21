@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import uuid
@@ -20,8 +21,12 @@ from aegis.queries import (
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
+
+logger = logging.getLogger(__name__)
 
 # ─── Alert Rules ──────────────────────────────────────────────────────────────
 
@@ -73,12 +78,14 @@ class IncidentEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._misses: dict[str, int] = {}
+        self._degraded: set[str] = set()
 
     def start(self) -> None:
         """Start the incident detection engine."""
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._resume_interrupted_investigations()
         self._thread = threading.Thread(
             target=self._run, name="aegis-incident-engine", daemon=True
         )
@@ -90,90 +97,151 @@ class IncidentEngine:
         if self._thread:
             self._thread.join(timeout=2)
 
+    def _resume_interrupted_investigations(self) -> None:
+        """Restart investigations that a crash or restart left in "investigating".
+
+        Their worker threads died with the process, and auto-resolution never
+        touches an investigating incident, so they would otherwise stay stuck.
+        """
+        try:
+            stuck = [
+                incident["id"]
+                for incident in self.store.list_incidents(limit=1000)
+                if incident["status"] == "investigating"
+            ]
+        except Exception:
+            logger.exception("Could not look for interrupted investigations")
+            return
+        for incident_id in stuck:
+            self._start_investigation(incident_id)
+
     def _run(self) -> None:
-        """Main engine loop."""
+        """Main engine loop; a failing cycle is logged and the next one still runs."""
         while not self._stop.is_set():
             try:
                 self.run_once()
-            except Exception as exc:  # the monitor must survive a malformed telemetry response
-                print(f"Incident engine error: {exc}")
-            self._stop.wait(self.settings.poll_seconds)
+            except Exception:
+                logger.exception("Incident engine cycle failed")
+            # A non-positive interval would turn a persistent failure into a busy loop.
+            self._stop.wait(max(1, self.settings.poll_seconds))
 
     def run_once(self) -> list[dict[str, Any]]:
-        """Execute one evaluation cycle of all alert rules."""
+        """Execute one evaluation cycle of all alert rules.
+
+        Each rule is isolated: a failure reading or recording one signal is
+        logged and does not stop the others. A signal that could not be read is
+        "unverified", and the incidents it drives are never auto-resolved on the
+        strength of a missing reading.
+        """
         fired: list[dict[str, Any]] = []
         fired_ids: set[str] = set()
+        unverified: set[str] = set()
 
         for rule in RULES:
-            result = self.telemetry.prometheus_query(rule.query)
-            value = result.get("value")
-            anomaly = self.detector.observe(rule.name, float(value or 0.0))
-
-            if not rule.fires(value):
+            try:
+                incident = self._evaluate_rule(rule, unverified)
+            except Exception:
+                logger.exception("Evaluating rule %s failed", rule.name)
+                unverified.add(rule.root_cause_key)
                 continue
+            if incident:
+                fired.append(incident)
+                fired_ids.add(incident["id"])
 
-            root = rule.root_cause_key
-            # Correlation: if checkout symptoms exist with inventory dependency errors,
-            # rewrite root cause to dependency:inventory
-            if rule.name in {"checkout_error_rate", "checkout_p95_latency"}:
-                dependency = self.telemetry.prometheus_query(
-                    INVENTORY_DEPENDENCY_ERRORS
-                ).get("value")
-                if dependency and dependency > DEPENDENCY_ERROR_THRESHOLD:
-                    root = "dependency:inventory"
-
-            evidence = {
-                "rule": rule.name,
-                "query": rule.query,
-                "value": value,
-                "threshold": rule.threshold,
-                # A flat baseline yields an infinite z-score, which JSON cannot represent.
-                "z_score": anomaly.z_score if anomaly.z_score is None or math.isfinite(anomaly.z_score) else None,
-                "baseline": anomaly.baseline,
-                "evaluated_at": utc_now(),
-                "source": "prometheus",
-            }
-
-            # Correlation is based on the root-cause key, not the incident ID.
-            # A fresh ID allows the same fault pattern to be recorded again after resolution.
-            incident_id = "inc-" + uuid.uuid4().hex[:10]
-            incident, created = self.store.upsert_incident(
-                incident_id, rule.title, rule.severity.value, root, evidence
-            )
-            fired.append(incident)
-            fired_ids.add(incident["id"])
-
-            if created:
-                self.store.update_incident(incident["id"], status="investigating")
-                self.store.add_event(
-                    incident["id"], "investigation_started", "Aegis is collecting evidence"
-                )
-                threading.Thread(
-                    target=self._investigate,
-                    args=(incident["id"],),
-                    name=f"investigate-{incident['id']}",
-                    daemon=True,
-                ).start()
-
-        self._resolve_missing(fired_ids)
+        try:
+            self._resolve_missing(fired_ids, unverified)
+        except Exception:
+            logger.exception("Resolving quiet incidents failed")
         return fired
 
+    def _evaluate_rule(self, rule: AlertRule, unverified: set[str]) -> dict[str, Any] | None:
+        """Evaluate one rule; return the incident it fired or updated, if any."""
+        result = self.telemetry.prometheus_query(rule.query)
+        if result.get("error"):
+            # Feeding a failed read to the detector as 0.0 would corrupt its baseline.
+            logger.warning("Rule %s unreadable: %s", rule.name, result["error"])
+            unverified.add(rule.root_cause_key)
+            return None
+        value = result.get("value")
+        anomaly = self.detector.observe(rule.name, float(value or 0.0))
+
+        if not rule.fires(value):
+            return None
+
+        root = rule.root_cause_key
+        # Correlation: if checkout symptoms exist with inventory dependency errors,
+        # rewrite root cause to dependency:inventory
+        if rule.name in {"checkout_error_rate", "checkout_p95_latency"}:
+            dependency_result = self.telemetry.prometheus_query(INVENTORY_DEPENDENCY_ERRORS)
+            if dependency_result.get("error"):
+                # Recording under the wrong root would open a duplicate incident.
+                logger.warning("Dependency check unreadable for rule %s", rule.name)
+                unverified.update({root, "dependency:inventory"})
+                return None
+            dependency = dependency_result.get("value")
+            if dependency and dependency > DEPENDENCY_ERROR_THRESHOLD:
+                root = "dependency:inventory"
+
+        evidence = {
+            "rule": rule.name,
+            "query": rule.query,
+            "value": value,
+            "threshold": rule.threshold,
+            # A flat baseline yields an infinite z-score, which JSON cannot represent.
+            "z_score": anomaly.z_score if anomaly.z_score is None or math.isfinite(anomaly.z_score) else None,
+            "baseline": anomaly.baseline,
+            "evaluated_at": utc_now(),
+            "source": "prometheus",
+        }
+
+        # Correlation is based on the root-cause key, not the incident ID.
+        # A fresh ID allows the same fault pattern to be recorded again after resolution.
+        incident_id = "inc-" + uuid.uuid4().hex[:10]
+        incident, created = self.store.upsert_incident(
+            incident_id, rule.title, rule.severity.value, root, evidence
+        )
+
+        if created and self.store.transition_status(incident["id"], "open", "investigating"):
+            self.store.add_event(
+                incident["id"], "investigation_started", "Aegis is collecting evidence"
+            )
+            self._start_investigation(incident["id"])
+        return incident
+
+    def _start_investigation(self, incident_id: str) -> None:
+        threading.Thread(
+            target=self._investigate,
+            args=(incident_id,),
+            name=f"investigate-{incident_id}",
+            daemon=True,
+        ).start()
+
     def _investigate(self, incident_id: str) -> None:
-        """Run agent investigation in a background thread."""
+        """Run agent investigation in a background thread; it never dies with the incident stuck."""
         try:
             self.agent.investigate(incident_id)
         except Exception as exc:
-            self.store.add_event(incident_id, "agent_error", str(exc))
-            self.store.update_incident(incident_id, status="open")
+            logger.exception("Investigation of %s failed", incident_id)
+            try:
+                self.store.add_event(incident_id, "agent_error", str(exc))
+                # Back to open so it can resolve or be re-investigated; a status that
+                # already moved on (approved, resolved) is left alone.
+                self.store.transition_status(incident_id, "investigating", "open")
+            except Exception:
+                logger.exception("Could not record the failed investigation of %s", incident_id)
 
-    def _resolve_missing(self, fired_ids: set[str]) -> None:
+    def _resolve_missing(
+        self, fired_ids: set[str], unverified_roots: Collection[str] = ()
+    ) -> None:
         """Resolve incidents that haven't fired for N cycles.
 
         Auto-resolution only applies to incidents that are still ``open`` and
         have not entered the investigation/approval pipeline. Missing signals
         during ``investigating``, ``recommendation_pending``, or ``approved``
         do not mean remediation finished; resolving there would close the
-        incident before the operator-approved action runs.
+        incident before the operator-approved action runs. An incident whose
+        signal could not be read this cycle (``unverified_roots``) neither
+        accumulates misses nor resolves, so a Prometheus outage cannot close it.
         """
         active = self.store.list_incidents()
         active_ids = {
@@ -182,7 +250,17 @@ class IncidentEngine:
             if incident["status"] not in {"resolved", "closed"}
         }
 
+        degraded = {
+            incident["id"]
+            for incident in active
+            if incident["id"] in active_ids and incident["root_cause_key"] in unverified_roots
+        }
+        self._note_degraded(degraded)
+
         for incident_id in active_ids:
+            if incident_id in degraded:
+                self._misses.pop(incident_id, None)
+                continue
             if incident_id in fired_ids:
                 self._misses[incident_id] = 0
                 continue
@@ -215,3 +293,13 @@ class IncidentEngine:
                 incident_id, "resolved", "Signals returned below the alert threshold"
             )
             self._misses.pop(incident_id, None)
+
+    def _note_degraded(self, degraded: set[str]) -> None:
+        """Record once per outage that an incident's signal cannot be read."""
+        for incident_id in degraded - self._degraded:
+            self.store.add_event(
+                incident_id,
+                "telemetry_unavailable",
+                "Aegis cannot read this incident's signal; it will not auto-resolve until it can",
+            )
+        self._degraded = degraded
