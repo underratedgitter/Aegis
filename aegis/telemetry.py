@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,21 @@ from aegis.queries import CHECKOUT_ERRORS_30M, CHECKOUT_REQUESTS_30M, SNAPSHOT_Q
 if TYPE_CHECKING:
     from aegis.settings import Settings
 
+# Every outbound call has explicit connect and read timeouts.
+CONNECT_TIMEOUT_SECONDS = 1.0
+READ_TIMEOUT_SECONDS = 3.0
+LOKI_TIMEOUT_SECONDS = 1.0
+
+# Prometheus queries are idempotent reads, so transient failures are retried with
+# exponential backoff. Attempts are bounded so a hung server cannot stall callers.
+QUERY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 0.25
+RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+# After a query exhausts its retries, further queries fail fast for this long instead of
+# each spending the full retry budget on a server that is down.
+BREAKER_COOLDOWN_SECONDS = 10.0
+
 
 class Telemetry:
     """Collects and queries telemetry data from various sources."""
@@ -22,22 +38,45 @@ class Telemetry:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client = httpx.Client(
-            timeout=httpx.Timeout(3.0, connect=1.0),
+            timeout=httpx.Timeout(READ_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS),
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=5,
                 keepalive_expiry=30,
             ),
         )
+        self._breaker_open_until = 0.0
+
+    def _get_once(self, url: str, params: dict[str, str]) -> httpx.Response:
+        response = self._client.get(url, params=params)
+        response.raise_for_status()
+        return response
+
+    def _get_with_retry(self, url: str, params: dict[str, str]) -> httpx.Response:
+        """GET with bounded retries for transport errors and transient HTTP statuses."""
+        for attempt in range(QUERY_ATTEMPTS - 1):
+            try:
+                return self._get_once(url, params)
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if not self._is_outage(exc):
+                    raise
+            time.sleep(RETRY_BACKOFF_SECONDS * 2**attempt)
+        return self._get_once(url, params)
 
     def prometheus_query(self, query: str) -> dict[str, Any]:
         """Execute a PromQL query against Prometheus."""
+        if time.monotonic() < self._breaker_open_until:
+            return {
+                "query": query,
+                "value": None,
+                "error": "Prometheus unavailable: recent queries failed, retrying shortly",
+                "source": "prometheus",
+            }
         try:
-            response = self._client.get(
-                f"{self.settings.prometheus_url.rstrip('/')}/api/v1/query",
-                params={"query": query},
+            response = self._get_with_retry(
+                f"{self.settings.prometheus_url.rstrip('/')}/api/v1/query", {"query": query}
             )
-            response.raise_for_status()
+            self._breaker_open_until = 0.0
             payload = response.json()
             if payload.get("status") != "success":
                 return {
@@ -54,10 +93,19 @@ class Telemetry:
                 if value is not None and not math.isfinite(value):
                     value = None
             return {"query": query, "value": value, "series": result, "source": "prometheus"}
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            if self._is_outage(exc):
+                self._breaker_open_until = time.monotonic() + BREAKER_COOLDOWN_SECONDS
             return {"query": query, "value": None, "error": f"HTTP error: {exc}", "source": "prometheus"}
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
             return {"query": query, "value": None, "error": f"Parse error: {exc}", "source": "prometheus"}
+
+    @staticmethod
+    def _is_outage(exc: Exception) -> bool:
+        """True for failures that say the server is unreachable or unhealthy, not that the query is bad."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in RETRYABLE_STATUS_CODES
+        return isinstance(exc, httpx.TransportError)
 
     def metric_snapshot(self) -> list[MetricSnapshot]:
         """Get a snapshot of all key metrics."""
@@ -142,13 +190,13 @@ class Telemetry:
         try:
             response = self._client.get(
                 f"{self.settings.loki_url.rstrip('/')}/ready",
-                timeout=httpx.Timeout(1.0),
+                timeout=httpx.Timeout(LOKI_TIMEOUT_SECONDS),
             )
             return TelemetryStatus(
                 available=response.is_success,
                 status_code=response.status_code,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             return TelemetryStatus(available=False, error=str(exc))
 
     def close(self) -> None:

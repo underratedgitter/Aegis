@@ -7,7 +7,10 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 
 def utc_now() -> str:
@@ -155,6 +158,54 @@ class Store:
             return self.get_incident(incident_id)
         sql = ", ".join(f"{key} = ?" for key in updates)
         with self.lock:
+            self.db.execute(
+                f"UPDATE incidents SET {sql} WHERE id = ?",
+                (*updates.values(), incident_id),
+            )
+            self.db.commit()
+            return self.get_incident(incident_id)
+
+    def merge_incident(
+        self,
+        incident_id: str,
+        data: dict[str, Any] | None = None,
+        *,
+        status: str | None = None,
+        resolved_at: str | None = None,
+        only_if_status: Collection[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically merge top-level keys into an incident's data and optionally set its status.
+
+        The read-modify-write runs under the store lock, so it cannot overwrite
+        evidence appended by ``upsert_incident`` between a caller's read and write.
+        Prefer this over ``update_incident(data=...)`` with a previously read snapshot.
+
+        Args:
+            data: Top-level keys to set; keys not named here are left untouched.
+            status: New status, if it should change.
+            resolved_at: New resolution timestamp, if it should change.
+            only_if_status: Apply the change only when the incident currently has
+                one of these statuses.
+
+        Returns:
+            The updated incident, or None if it is missing or its status is not allowed.
+        """
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            current = self._row(row)
+            if current is None:
+                return None
+            if only_if_status is not None and current["status"] not in only_if_status:
+                return None
+            merged = {**current["data"], **(data or {})}
+            updates: dict[str, Any] = {"data_json": json.dumps(merged)}
+            if status is not None:
+                updates["status"] = status
+            if resolved_at is not None:
+                updates["resolved_at"] = resolved_at
+            sql = ", ".join(f"{key} = ?" for key in updates)
             self.db.execute(
                 f"UPDATE incidents SET {sql} WHERE id = ?",
                 (*updates.values(), incident_id),
