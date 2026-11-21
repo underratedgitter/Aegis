@@ -46,6 +46,19 @@ class TestTelemetry:
             result = telemetry.prometheus_query("up")
             assert result["value"] is None
 
+    def test_prometheus_query_treats_nan_as_no_data(self):
+        # histogram_quantile returns "NaN" when there is no traffic; NaN is not JSON-safe.
+        telemetry = Telemetry(self.settings)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "status": "success",
+            "data": {"result": [{"value": [1234567890, "NaN"]}]},
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(telemetry._client, "get", return_value=mock_response):
+            assert telemetry.prometheus_query("up")["value"] is None
+
     def test_prometheus_query_failure(self):
         telemetry = Telemetry(self.settings)
         mock_response = MagicMock()

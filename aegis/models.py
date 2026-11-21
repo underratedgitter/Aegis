@@ -15,6 +15,7 @@ class IncidentStatus(StrEnum):
     INVESTIGATING = "investigating"
     RECOMMENDATION_PENDING = "recommendation_pending"
     APPROVED = "approved"
+    EXECUTING = "executing"
     RESOLVED = "resolved"
     CLOSED = "closed"
 

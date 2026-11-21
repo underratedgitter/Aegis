@@ -90,3 +90,41 @@ class TestToolResultsAreSerialisable:
         assert action == "clear_fault"
         assert target == "inventory"
         executor.close()
+
+
+class TestMalformedLlmOutput:
+    """A malformed LLM answer must not be stored or surface as a 500."""
+
+    def _investigate_with_llm_answer(self, tmp_path, monkeypatch, answer):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        settings = Settings(
+            db_path=str(tmp_path / "db.sqlite"),
+            log_dir=str(tmp_path / "logs"),
+            runbook_dir="runbooks",
+        )
+        store = Store(settings.db_path)
+        agent = AgentInvestigator(settings, store, FakeTelemetry())
+        monkeypatch.setattr(agent, "_llm_investigation", lambda incident: answer)
+        incident, _ = store.upsert_incident(
+            "inc-llm", "dependency", "high", "dependency:inventory", {"value": 1}
+        )
+        return agent.investigate(incident["id"]), store
+
+    def test_missing_recommendation_falls_back_to_local(self, tmp_path, monkeypatch):
+        result, store = self._investigate_with_llm_answer(
+            tmp_path, monkeypatch, {"hypothesis": "h", "confidence": "high"}
+        )
+
+        assert result["mode"] == "local_fallback"
+        assert "recommendation" in result["fallback_reason"]
+        assert store.get_incident("inc-llm")["data"]["recommendation"]["target"] == "inventory"
+
+    def test_invalid_recommendation_falls_back_to_local(self, tmp_path, monkeypatch):
+        answer = {
+            "hypothesis": "h",
+            "confidence": "certain",
+            "recommendation": {"action": ["clear_fault"], "target": "checkout"},
+        }
+        result, _ = self._investigate_with_llm_answer(tmp_path, monkeypatch, answer)
+
+        assert result["mode"] == "local_fallback"

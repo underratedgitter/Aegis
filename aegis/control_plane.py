@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 settings = Settings()
 settings.ensure_dirs()
-store = Store(settings.db_path)
+store = Store(settings.db_path, settings.max_evidence_history)
 telemetry = Telemetry(settings)
 engine = IncidentEngine(settings, store, telemetry)
 agent = AgentInvestigator(settings, store, telemetry)
@@ -115,7 +115,7 @@ def verify_api_key(request: Request) -> None:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        if hmac.compare_digest(token, API_KEY):
+        if hmac.compare_digest(token.encode(), API_KEY.encode()):
             return
     raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
@@ -128,6 +128,7 @@ PROTECTED = [Depends(verify_api_key)]
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    store.recover_interrupted_executions()
     engine.start()
     try:
         yield
@@ -263,6 +264,9 @@ def get_incident(incident_id: str) -> dict[str, Any]:
 
 @app.post("/api/incidents/{incident_id}/investigate", response_model=InvestigateResponse, dependencies=PROTECTED)
 def investigate(incident_id: str) -> InvestigateResponse:
+    incident = store.get_incident(incident_id)
+    if incident and incident["status"] in {"resolved", "closed"}:
+        raise HTTPException(status_code=409, detail="Incident is already resolved")
     try:
         result = agent.investigate(incident_id)
     except ValueError as exc:

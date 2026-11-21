@@ -64,6 +64,11 @@ class RemediationExecutor:
         recommendation = approval.get("recommendation") or incident["data"].get("recommendation")
         action, target = self.validate_recommendation(recommendation)
 
+        if not self.settings.api_key.strip():
+            raise RemediationError(
+                "AEGIS_API_KEY is required before remediation can call the service admin API"
+            )
+
         payload: dict[str, Any]
         endpoint: str
         if action == RemediationAction.CLEAR_FAULT.value:
@@ -74,10 +79,9 @@ class RemediationExecutor:
             payload = {"replicas": replicas}
             endpoint = "/admin/scale"
 
-        if not self.settings.api_key.strip():
-            raise RemediationError(
-                "AEGIS_API_KEY is required before remediation can call the service admin API"
-            )
+        # Claim the incident atomically so concurrent calls cannot both fire the action.
+        if not self.store.transition_status(incident_id, "approved", "executing"):
+            raise RemediationError("Remediation is already executing or no longer approved")
 
         try:
             response = self._client.post(
@@ -88,6 +92,8 @@ class RemediationExecutor:
             response.raise_for_status()
             result = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            # Nothing was applied, so release the claim and let the operator retry.
+            self.store.transition_status(incident_id, "executing", "approved")
             raise RemediationError(f"Remediation request failed: {exc}") from exc
 
         data = {
@@ -134,9 +140,10 @@ class RemediationExecutor:
         action = recommendation.get("action")
         target = recommendation.get("target")
 
-        if action not in {a.value for a in RemediationAction}:
+        # An LLM can return a list or dict here, which is unhashable for the set/dict lookups.
+        if not isinstance(action, str) or action not in {a.value for a in RemediationAction}:
             raise RemediationError("Action is outside the Aegis allowlist")
-        if target not in self.targets:
+        if not isinstance(target, str) or target not in self.targets:
             raise RemediationError("Target is outside the Aegis allowlist")
 
         parameters = recommendation.get("parameters")

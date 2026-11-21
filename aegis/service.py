@@ -206,7 +206,7 @@ def require_admin_key(request: Request) -> None:
         )
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and hmac.compare_digest(
-        auth_header[7:], expected
+        auth_header[7:].encode(), expected.encode()
     ):
         return
     raise HTTPException(status_code=401, detail="Invalid or missing API key.")

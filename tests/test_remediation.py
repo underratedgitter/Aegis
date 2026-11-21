@@ -118,3 +118,99 @@ def test_execute_requires_admin_key(tmp_path):
 
     with pytest.raises(RemediationError, match="AEGIS_API_KEY"):
         executor.execute(incident["id"], "operator")
+
+
+@pytest.mark.parametrize("bad", [["clear_fault"], {"a": 1}])
+@pytest.mark.parametrize("field", ["action", "target"])
+def test_validate_recommendation_rejects_unhashable_action_or_target(tmp_path, field, bad):
+    executor = RemediationExecutor(
+        Settings(
+            db_path=str(tmp_path / "db.sqlite"),
+            checkout_url="http://checkout",
+            inventory_url="http://inventory",
+        ),
+        Store(str(tmp_path / "db.sqlite")),
+    )
+    recommendation = {
+        "action": "clear_fault",
+        "target": "checkout",
+        "parameters": {"fault": "errors"},
+        field: bad,
+    }
+
+    with pytest.raises(RemediationError, match="allowlist"):
+        executor.validate_recommendation(recommendation)
+
+
+def _approved_executor(tmp_path):
+    db_path = str(tmp_path / "db.sqlite")
+    settings = Settings(
+        db_path=db_path,
+        checkout_url="http://checkout",
+        inventory_url="http://inventory",
+        api_key="test-key",
+    )
+    store = Store(db_path)
+    store.upsert_incident("inc-race", "t", "high", "dependency:inventory", {"value": 1})
+    recommendation = {
+        "action": "clear_fault",
+        "target": "inventory",
+        "parameters": {"fault": "dependency"},
+    }
+    store.update_incident(
+        "inc-race", status="approved", data={"approval": {"recommendation": recommendation}}
+    )
+    return RemediationExecutor(settings, store), store
+
+
+def test_concurrent_execute_fires_the_admin_action_once(tmp_path, monkeypatch):
+    import threading
+
+    executor, store = _approved_executor(tmp_path)
+    calls = []
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def slow_post(url, json, headers=None, timeout=None):
+        calls.append(url)
+        in_flight.set()
+        release.wait(timeout=5)
+        return FakeResponse()
+
+    monkeypatch.setattr(executor._client, "post", slow_post)
+    outcomes: list[object] = []
+
+    def run():
+        try:
+            outcomes.append(executor.execute("inc-race", "operator"))
+        except RemediationError as exc:
+            outcomes.append(exc)
+
+    first = threading.Thread(target=run)
+    first.start()
+    assert in_flight.wait(timeout=5)
+    second = threading.Thread(target=run)
+    second.start()
+    second.join(timeout=5)
+    release.set()
+    first.join(timeout=5)
+
+    assert len(calls) == 1
+    assert sorted(type(o).__name__ for o in outcomes) == ["RemediationError", "dict"]
+    assert store.get_incident("inc-race")["status"] == "open"
+
+
+def test_failed_execute_returns_incident_to_approved_for_retry(tmp_path, monkeypatch):
+    import httpx
+
+    executor, store = _approved_executor(tmp_path)
+
+    def failing_post(url, json, headers=None, timeout=None):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(executor._client, "post", failing_post)
+
+    with pytest.raises(RemediationError, match="request failed"):
+        executor.execute("inc-race", "operator")
+
+    assert store.get_incident("inc-race")["status"] == "approved"

@@ -23,6 +23,7 @@ class TestEnums:
         assert IncidentStatus.INVESTIGATING == "investigating"
         assert IncidentStatus.RECOMMENDATION_PENDING == "recommendation_pending"
         assert IncidentStatus.APPROVED == "approved"
+        assert IncidentStatus.EXECUTING == "executing"
         assert IncidentStatus.RESOLVED == "resolved"
         assert IncidentStatus.CLOSED == "closed"
 

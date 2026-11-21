@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from aegis.models import (
     Evidence,
+    Investigation,
     InvestigationMode,
     Recommendation,
     RemediationAction,
@@ -52,6 +53,8 @@ class AgentInvestigator:
             try:
                 result = self._llm_investigation(incident)
                 result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
+                # Reject malformed LLM output before it is stored or proposed for approval.
+                Investigation.model_validate(result)
             except Exception as exc:
                 result = self._local_investigation(incident)
                 result["mode"] = InvestigationMode.LOCAL_FALLBACK.value

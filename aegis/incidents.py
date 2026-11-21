@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -126,7 +127,8 @@ class IncidentEngine:
                 "query": rule.query,
                 "value": value,
                 "threshold": rule.threshold,
-                "z_score": anomaly.z_score,
+                # A flat baseline yields an infinite z-score, which JSON cannot represent.
+                "z_score": anomaly.z_score if anomaly.z_score is None or math.isfinite(anomaly.z_score) else None,
                 "baseline": anomaly.baseline,
                 "evaluated_at": utc_now(),
                 "source": "prometheus",

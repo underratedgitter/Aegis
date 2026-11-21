@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from aegis.incidents import IncidentEngine
@@ -130,3 +132,23 @@ def test_remediated_incident_gets_a_fresh_resolution_window(tmp_path):
 
     engine._resolve_missing(set())
     assert store.get_incident(incident["id"])["status"] == "resolved"
+
+
+def test_incident_evidence_is_json_safe_when_the_baseline_was_flat(tmp_path):
+    """A flat baseline gives an infinite z-score, which must not reach the API as Infinity."""
+    settings = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    store = Store(settings.db_path)
+    telemetry = FakeTelemetry()
+    engine = IncidentEngine(settings, store, telemetry)
+    engine._investigate = lambda incident_id: None
+
+    telemetry.firing = False
+    for _ in range(engine.detector.minimum_samples):
+        engine.run_once()
+    telemetry.firing = True
+
+    fired = engine.run_once()
+
+    assert fired
+    json.dumps(fired, allow_nan=False)
+    assert fired[0]["data"]["latest_evidence"]["z_score"] is None

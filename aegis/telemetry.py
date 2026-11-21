@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,9 @@ class Telemetry:
             if result:
                 raw = result[0].get("value", [None, None])[1]
                 value = float(raw) if raw is not None else None
+                # NaN/Inf (e.g. histogram_quantile with no traffic) mean "no data" and are not JSON-safe.
+                if value is not None and not math.isfinite(value):
+                    value = None
             return {"query": query, "value": value, "series": result, "source": "prometheus"}
         except httpx.HTTPError as exc:
             return {"query": query, "value": None, "error": f"HTTP error: {exc}", "source": "prometheus"}

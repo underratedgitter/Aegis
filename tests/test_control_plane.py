@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aegis.control_plane import app, store
+from aegis.storage import utc_now
 
 
 @pytest.fixture
@@ -149,3 +150,47 @@ class TestEngineEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "fired" in data
+
+
+class TestInvestigateResolvedIncident:
+    def test_resolved_incident_is_not_reopened_by_investigation(self, client):
+        store.upsert_incident("inc-resolved-1", "Done", "high", "service:resolved", {"v": 1})
+        store.update_incident("inc-resolved-1", status="resolved", resolved_at=utc_now())
+
+        response = client.post("/api/incidents/inc-resolved-1/investigate")
+
+        assert response.status_code == 409
+        assert store.get_incident("inc-resolved-1")["status"] == "resolved"
+
+
+class TestInvestigateMalformedLlmOutput:
+    def test_malformed_llm_answer_returns_a_valid_local_investigation(self, client, monkeypatch):
+        from aegis.control_plane import agent
+
+        store.upsert_incident("inc-llm-bad", "Bad LLM", "high", "service:llm-bad", {"v": 1})
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setattr(agent, "_llm_investigation", lambda incident: {"hypothesis": "h"})
+
+        response = client.post("/api/incidents/inc-llm-bad/investigate")
+
+        assert response.status_code == 200
+        assert response.json()["investigation"]["mode"] == "local_fallback"
+
+
+class TestStartupRecovery:
+    def test_incident_stuck_executing_is_returned_to_approved_on_startup(self, monkeypatch):
+        from aegis import control_plane
+
+        # The lifespan would start the real engine and close the shared store on exit.
+        for target in (control_plane.engine, control_plane.telemetry, control_plane.remediation):
+            monkeypatch.setattr(target, "start", lambda: None, raising=False)
+            monkeypatch.setattr(target, "stop", lambda: None, raising=False)
+            monkeypatch.setattr(target, "close", lambda: None, raising=False)
+        monkeypatch.setattr(store, "close", lambda: None)
+        store.upsert_incident("inc-crashed", "Crashed", "high", "service:crashed", {"v": 1})
+        store.update_incident("inc-crashed", status="executing")
+
+        with TestClient(app):
+            assert store.get_incident("inc-crashed")["status"] == "approved"
+
+        assert store.events("inc-crashed")[-1]["kind"] == "recovery"

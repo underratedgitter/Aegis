@@ -18,8 +18,9 @@ def utc_now() -> str:
 class Store:
     """Thread-safe SQLite storage for incidents and events."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_evidence: int = 100):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.max_evidence = max(1, max_evidence)  # [-0:] would keep everything
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=10)
         self.db.row_factory = sqlite3.Row
@@ -72,7 +73,7 @@ class Store:
             rows = self.db.execute(
                 "SELECT * FROM incidents ORDER BY CASE status WHEN 'open' THEN 0 "
                 "WHEN 'investigating' THEN 1 WHEN 'recommendation_pending' THEN 2 "
-                "WHEN 'approved' THEN 3 ELSE 4 END, last_seen DESC LIMIT ?",
+                "WHEN 'approved' THEN 3 WHEN 'executing' THEN 3 ELSE 4 END, last_seen DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return self._rows(rows)
@@ -119,7 +120,7 @@ class Store:
                 merged = {
                     **existing["data"],
                     "latest_evidence": evidence,
-                    "evidence": evidence_history[-100:],
+                    "evidence": evidence_history[-self.max_evidence :],
                 }
                 self.db.execute(
                     "UPDATE incidents SET last_seen = ?, data_json = ? WHERE id = ?",
@@ -160,6 +161,46 @@ class Store:
             )
             self.db.commit()
             return self.get_incident(incident_id)
+
+    def transition_status(self, incident_id: str, expected: str, new: str) -> bool:
+        """Atomically move an incident from the expected status to a new one.
+
+        Returns:
+            True if this call made the transition, False if the incident was
+            missing or no longer in the expected status.
+        """
+        with self.lock:
+            cursor = self.db.execute(
+                "UPDATE incidents SET status = ? WHERE id = ? AND status = ?",
+                (new, incident_id, expected),
+            )
+            self.db.commit()
+            return cursor.rowcount == 1
+
+    def recover_interrupted_executions(self) -> list[str]:
+        """Return incidents left in "executing" by a crash to "approved" so they can be retried.
+
+        Only call this at startup, before anything can start a new execution.
+
+        Returns:
+            IDs of the incidents that were recovered.
+        """
+        with self.lock:
+            rows = self.db.execute("SELECT id FROM incidents WHERE status = 'executing'").fetchall()
+            recovered = [row["id"] for row in rows]
+            for incident_id in recovered:
+                self.db.execute(
+                    "UPDATE incidents SET status = 'approved' WHERE id = ?", (incident_id,)
+                )
+                self.add_event(
+                    incident_id,
+                    "recovery",
+                    "Remediation was interrupted by a control-plane restart; the action may or "
+                    "may not have been applied. Check the target, then retry Execute if needed.",
+                    commit=False,
+                )
+            self.db.commit()
+            return recovered
 
     def add_event(
         self,
