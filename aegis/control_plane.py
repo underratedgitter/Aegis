@@ -246,9 +246,13 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
             remediation.validate_recommendation(rec)
         except RemediationError:
             continue
-        data = {**inc["data"], "approval": {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}}
-        store.update_incident(inc["id"], status="approved", data=data)
-        store.add_event(inc["id"], "approval", f"Batch approval from {request.approver}", data["approval"])
+        approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}
+        # Atomic: skips an incident that left recommendation_pending since the listing.
+        if not store.merge_incident(
+            inc["id"], {"approval": approval}, status="approved", only_if_status={"recommendation_pending"}
+        ):
+            continue
+        store.add_event(inc["id"], "approval", f"Batch approval from {request.approver}", approval)
         approved.append(inc["id"])
     _audit("batch_approve", {"approver": request.approver, "count": len(approved)})
     return {"approved": approved, "count": len(approved)}
@@ -288,9 +292,13 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         remediation.validate_recommendation(recommendation)
     except RemediationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    data = {**incident["data"], "approval": {"approver": request.approver, "approved_at": utc_now(), "recommendation": recommendation}}
-    store.update_incident(incident_id, status="approved", data=data)
-    store.add_event(incident_id, "approval", f"Human approval recorded from {request.approver}", data["approval"])
+    approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": recommendation}
+    # Atomic: a concurrent approval, or evidence appended since the read above, is not overwritten.
+    if not store.merge_incident(
+        incident_id, {"approval": approval}, status="approved", only_if_status={"recommendation_pending"}
+    ):
+        raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
+    store.add_event(incident_id, "approval", f"Human approval recorded from {request.approver}", approval)
     _audit("approve", {"incident_id": incident_id, "approver": request.approver})
     return ApprovalResponse(**get_incident(incident_id))
 
