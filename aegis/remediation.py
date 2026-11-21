@@ -13,6 +13,9 @@ from aegis.storage import Store, utc_now
 if TYPE_CHECKING:
     from aegis.settings import Settings
 
+# Read/write/pool timeout for the services' admin API; connect fails faster.
+ADMIN_TIMEOUT_SECONDS = 5.0
+
 
 class RemediationError(ValueError):
     """Raised when remediation validation or execution fails."""
@@ -37,7 +40,7 @@ class RemediationExecutor:
             "checkout": settings.checkout_url,
             "inventory": settings.inventory_url,
         }
-        self._client = httpx.Client(timeout=5.0)
+        self._client = httpx.Client(timeout=httpx.Timeout(ADMIN_TIMEOUT_SECONDS, connect=2.0))
 
     def execute(self, incident_id: str, approver: str) -> dict[str, Any]:
         """
@@ -90,23 +93,37 @@ class RemediationExecutor:
                 headers=bearer_header(self.settings.api_key),
             )
             response.raise_for_status()
-            result = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            # Nothing was applied, so release the claim and let the operator retry.
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # The call is not retried here: it changes state, so a person decides after
+            # checking the target. Release the claim so Execute can be pressed again.
             self.store.transition_status(incident_id, "executing", "approved")
-            raise RemediationError(f"Remediation request failed: {exc}") from exc
+            outcome = self._failure_outcome(exc)
+            self.store.add_event(
+                incident_id,
+                "remediation_failed",
+                f"Remediation {action} on {target} failed ({outcome}): {exc}",
+                {"action": action, "target": target, "approver": approver, "error": str(exc)},
+            )
+            raise RemediationError(f"Remediation request failed ({outcome}): {exc}") from exc
 
-        data = {
-            **incident["data"],
-            "remediation": {
-                "action": action,
-                "target": target,
-                "approver": approver,
-                "at": utc_now(),
-                "result": result,
-            },
+        # A 2xx means the action was applied; an unreadable body must not make it look failed.
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"raw": response.text[:500]}
+
+        remediation = {
+            "action": action,
+            "target": target,
+            "approver": approver,
+            "at": utc_now(),
+            "result": result,
         }
-        self.store.update_incident(incident_id, status="open", data=data)
+        # Merge rather than write back the snapshot read above: signals that arrived
+        # during the HTTP call appended evidence that a stale write would erase.
+        self.store.merge_incident(
+            incident_id, {"remediation": remediation}, status="open", only_if_status={"executing"}
+        )
         self.store.add_event(
             incident_id,
             "remediation_executed",
@@ -121,7 +138,19 @@ class RemediationExecutor:
             "result": result,
         }
 
-    def validate_recommendation(self, recommendation: Any) -> tuple[str, str]:
+    @staticmethod
+    def _failure_outcome(exc: Exception) -> str:
+        """Say whether the target may have applied a request that did not complete cleanly."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            if exc.response.status_code < 500:
+                return "rejected, not applied"
+            return "server error, may have been applied"
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.InvalidURL)):
+            return "not sent, not applied"
+        return "no response, may have been applied"
+
+    @classmethod
+    def validate_recommendation(cls, recommendation: Any) -> tuple[str, str]:
         """
         Validate a recommendation against the allowlist.
 
@@ -143,7 +172,7 @@ class RemediationExecutor:
         # An LLM can return a list or dict here, which is unhashable for the set/dict lookups.
         if not isinstance(action, str) or action not in {a.value for a in RemediationAction}:
             raise RemediationError("Action is outside the Aegis allowlist")
-        if not isinstance(target, str) or target not in self.targets:
+        if not isinstance(target, str) or target not in cls.ALLOWED_FAULTS_BY_TARGET:
             raise RemediationError("Target is outside the Aegis allowlist")
 
         parameters = recommendation.get("parameters")
@@ -152,9 +181,9 @@ class RemediationExecutor:
 
         if action == RemediationAction.CLEAR_FAULT.value:
             fault = parameters.get("fault")
-            if fault not in self.ALLOWED_FAULTS:
+            if not isinstance(fault, str) or fault not in cls.ALLOWED_FAULTS:
                 raise RemediationError("Fault is outside the Aegis allowlist")
-            if fault not in self.ALLOWED_FAULTS_BY_TARGET.get(target, set()):
+            if fault not in cls.ALLOWED_FAULTS_BY_TARGET.get(target, frozenset()):
                 raise RemediationError("Fault is not valid for the selected target")
         else:
             try:
