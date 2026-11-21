@@ -163,6 +163,17 @@ class TestChaosRequest:
         with pytest.raises(ValidationError):
             ChaosRequest(service="checkout", fault="invalid")
 
+    def test_unknown_fields_are_rejected(self):
+        with pytest.raises(ValidationError):
+            ChaosRequest(service="checkout", fault="latency", path="/etc")  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1])
+    def test_non_finite_or_negative_numbers_are_rejected(self, value):
+        with pytest.raises(ValidationError):
+            ChaosRequest(service="checkout", fault="latency", intensity=value)
+        with pytest.raises(ValidationError):
+            ChaosRequest(service="checkout", fault="latency", duration_seconds=value)
+
     def test_duration_bounds(self):
         with pytest.raises(ValidationError):
             ChaosRequest(service="checkout", fault="latency", duration_seconds=0)
@@ -178,6 +189,22 @@ class TestApprovalRequest:
     def test_custom_approver(self):
         req = ApprovalRequest(approver="admin")
         assert req.approver == "admin"
+
+    @pytest.mark.parametrize(
+        "approver",
+        ["<script>x</script>", "ops\nteam", "ops\n", " ops", "a\u202eb", "bob; DROP", "x'y"],
+    )
+    def test_approver_rejects_markup_and_control_characters(self, approver):
+        with pytest.raises(ValidationError):
+            ApprovalRequest(approver=approver)
+
+    @pytest.mark.parametrize("approver", ["demo-operator", "Ada Lovelace", "ops.team+1@example.com"])
+    def test_approver_accepts_plain_names(self, approver):
+        assert ApprovalRequest(approver=approver).approver == approver
+
+    def test_unknown_fields_are_rejected(self):
+        with pytest.raises(ValidationError):
+            ApprovalRequest(approver="admin", role="root")  # type: ignore[call-arg]
 
     def test_approver_length_bounds(self):
         with pytest.raises(ValidationError):

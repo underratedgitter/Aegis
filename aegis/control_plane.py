@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hmac
 import io
 import threading
 import time
@@ -21,8 +20,16 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from aegis.agent import AgentInvestigator
-from aegis.auth import bearer_header
+from aegis.auth import AuthFailureLimiter, bearer_header, presented_token, token_matches
+from aegis.http_security import (
+    DOCS_CSP,
+    UI_CSP,
+    BodyLimitMiddleware,
+    SecurityHeadersMiddleware,
+    internal_error_response,
+)
 from aegis.incidents import IncidentEngine
+from aegis.logging_utils import configure_logging
 from aegis.models import (
     ApprovalRequest,
     ApprovalResponse,
@@ -48,6 +55,7 @@ if TYPE_CHECKING:
 
     from starlette.responses import Response
 
+logger = configure_logging("aegis-control-plane")
 settings = Settings()
 settings.ensure_dirs()
 store = Store(settings.db_path, settings.max_evidence_history)
@@ -100,6 +108,17 @@ def _check_rate_limit(client_ip: str) -> None:
 # ─── Authentication ───────────────────────────────────────────────────────────
 
 API_KEY = settings.api_key
+_auth_failures = AuthFailureLimiter(settings.auth_fail_max, settings.auth_fail_window)
+
+
+def _warn_if_unauthenticated() -> None:
+    """Make demo mode impossible to miss in the logs of a real deployment."""
+    if not API_KEY:
+        logger.warning(
+            "SECURITY WARNING: AEGIS_API_KEY is not set. Approve, execute, investigate, "
+            "run-once and audit endpoints are open to anyone who can reach this port, and "
+            "fault injection is disabled. Set AEGIS_API_KEY before exposing Aegis beyond localhost."
+        )
 
 
 def verify_api_key(request: Request) -> None:
@@ -108,15 +127,24 @@ def verify_api_key(request: Request) -> None:
 
     When AEGIS_API_KEY is unset the check is a no-op, which keeps the local demo
     runnable with no configuration. When it is set, every route that mutates
-    incident state or injects chaos requires it.
+    incident state or injects chaos requires it. A client that keeps presenting
+    wrong tokens is locked out with 429 for the rest of the failure window.
     """
     if not API_KEY:
         return
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        if hmac.compare_digest(token.encode(), API_KEY.encode()):
+    client = request.client.host if request.client else "unknown"
+    retry_after = _auth_failures.retry_after(client)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication attempts.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    token = presented_token(request.headers.get("Authorization", ""))
+    if token is not None:
+        if token_matches(token, API_KEY):
             return
+        _auth_failures.record_failure(client)
     raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
@@ -128,6 +156,7 @@ PROTECTED = [Depends(verify_api_key)]
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    _warn_if_unauthenticated()
     store.recover_interrupted_executions()
     engine.start()
     try:
@@ -140,18 +169,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Aegis SRE Copilot", version="0.3.0", lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
-# Credentials cannot be combined with a wildcard origin; browsers reject the pair.
-# Aegis authenticates with a bearer token, not cookies, so credentials stay off.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+# Innermost on purpose: a body-limit error raised while the route reads the body
+# only becomes a 413 if nothing between it and FastAPI wraps the receive channel.
+app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
 
 
 @app.middleware("http")
@@ -170,6 +194,35 @@ async def request_middleware(
     response = await call_next(request)
     response.headers["X-Request-Id"] = request_id
     return response
+
+
+def _install_hardening(application: FastAPI, cfg: Settings) -> None:
+    """
+    Add the request/response guards; the last one added is the outermost.
+
+    Security headers wrap everything, so CORS preflights and 413s carry them too.
+    CORS sits outside the body limit so browsers can read a 413. With no
+    AEGIS_CORS_ORIGINS there is no CORS middleware and browsers keep their
+    same-origin default. Aegis authenticates with a bearer token, not cookies,
+    so credentials stay off.
+    """
+    if cfg.cors_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(cfg.cors_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
+            expose_headers=["X-Request-Id", "Retry-After"],
+            max_age=600,
+        )
+    application.add_middleware(
+        SecurityHeadersMiddleware, csp=UI_CSP, path_csp={"/docs": DOCS_CSP, "/redoc": DOCS_CSP}
+    )
+    application.add_exception_handler(Exception, internal_error_response)
+
+
+_install_hardening(app, settings)
 
 
 # ─── Health & Overview ────────────────────────────────────────────────────────
@@ -204,7 +257,7 @@ def overview() -> OverviewResponse:
 # ─── Incidents (list, export, and batch BEFORE /{id} routes) ──────────────────
 
 @app.get("/api/incidents")
-def list_incidents(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200), status: str | None = None, severity: str | None = None, search: str | None = None) -> dict[str, Any]:
+def list_incidents(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200), status: str | None = Query(None, max_length=64), severity: str | None = Query(None, max_length=64), search: str | None = Query(None, max_length=200)) -> dict[str, Any]:
     all_incidents = store.list_incidents(limit=500)
     if status:
         all_incidents = [i for i in all_incidents if i["status"] == status]
@@ -350,7 +403,7 @@ def metrics() -> list[MetricSnapshot]:
 
 
 @app.get("/api/logs")
-def logs(service: str | None = None, limit: int = 40) -> list[dict[str, Any]]:
+def logs(service: str | None = Query(None, max_length=64), limit: int = 40) -> list[dict[str, Any]]:
     return telemetry.recent_logs(service, max(1, min(limit, 200)))
 
 

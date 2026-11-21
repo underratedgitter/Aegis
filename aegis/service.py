@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import os
 import threading
 import time
@@ -15,7 +14,15 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from aegis.auth import AuthFailureLimiter, presented_token, token_matches
+from aegis.http_security import (
+    API_CSP,
+    BodyLimitMiddleware,
+    SecurityHeadersMiddleware,
+    internal_error_response,
+)
 from aegis.logging_utils import configure_logging
+from aegis.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -24,6 +31,8 @@ SERVICE = os.getenv("SERVICE_NAME", "checkout")
 DEPENDENCY_URL = os.getenv("DEPENDENCY_URL", "")
 LOG_PATH = os.getenv("LOG_PATH", f"./logs/{SERVICE}.jsonl")
 logger = configure_logging(SERVICE, LOG_PATH)
+_settings = Settings()
+_auth_failures = AuthFailureLimiter(_settings.auth_fail_max, _settings.auth_fail_window)
 
 HTTP_REQUESTS = Counter(
     "aegis_http_requests_total", "HTTP requests handled", ["service", "method", "route", "status"]
@@ -204,11 +213,19 @@ def require_admin_key(request: Request) -> None:
             status_code=503,
             detail="Admin API disabled: set AEGIS_API_KEY to enable fault injection.",
         )
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and hmac.compare_digest(
-        auth_header[7:].encode(), expected.encode()
-    ):
-        return
+    client = request.client.host if request.client else "unknown"
+    retry_after = _auth_failures.retry_after(client)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication attempts.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    token = presented_token(request.headers.get("Authorization", ""))
+    if token is not None:
+        if token_matches(token, expected):
+            return
+        _auth_failures.record_failure(client)
     raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
@@ -224,6 +241,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title=f"Aegis demo service: {SERVICE}", lifespan=lifespan)
+
+
+# Body limit is innermost so a streamed oversize body becomes a 413, not a 400
+# (the observe middleware below wraps the receive channel); security headers are
+# outermost so they cover every response.
+app.add_middleware(BodyLimitMiddleware, max_bytes=_settings.max_body_bytes)
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -258,6 +281,10 @@ async def observe(
                 "duration_ms": round(elapsed * 1000, 2),
             },
         )
+
+
+app.add_middleware(SecurityHeadersMiddleware, csp=API_CSP)
+app.add_exception_handler(Exception, internal_error_response)
 
 
 @app.get("/")
