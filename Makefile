@@ -1,4 +1,4 @@
-.PHONY: start up down logs test lint format typecheck chaos clean help
+.PHONY: start up down logs backup test lint format typecheck chaos clean help
 
 # Default target
 help:
@@ -8,6 +8,7 @@ help:
 	@echo "  make up        - Start services without building"
 	@echo "  make down      - Stop all services"
 	@echo "  make logs      - View logs for control, checkout, and inventory"
+	@echo "  make backup    - Save a consistent copy of the incident database to ./backups"
 	@echo "  make test      - Run tests"
 	@echo "  make lint      - Run linter"
 	@echo "  make format    - Format code"
@@ -27,6 +28,14 @@ down:
 
 logs:
 	docker compose logs -f control checkout inventory
+
+backup:
+	@mkdir -p backups
+	@name=aegis-$$(date -u +%Y%m%dT%H%M%SZ).db; \
+	docker compose exec -T control python -m aegis.backup_main /data/backups/$$name >/dev/null && \
+	docker compose cp control:/data/backups/$$name backups/$$name && \
+	docker compose exec -T control rm /data/backups/$$name && \
+	echo "Backup written to backups/$$name"
 
 test:
 	python -m pytest -v --tb=short

@@ -297,6 +297,21 @@ async def healthz() -> dict[str, str]:
     return {"service": SERVICE, "status": "ok"}
 
 
+@app.get("/readyz")
+async def readyz() -> dict[str, Any]:
+    """Readiness: always 200 while the process serves; a down dependency reports "degraded"."""
+    checks: dict[str, str] = {}
+    if DEPENDENCY_URL:
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                response = await client.get(f"{DEPENDENCY_URL.rstrip('/')}/healthz")
+            checks["dependency"] = "ok" if response.is_success else "unavailable"
+        except httpx.HTTPError:
+            checks["dependency"] = "unavailable"
+    status = "degraded" if "unavailable" in checks.values() else "ok"
+    return {"service": SERVICE, "status": status, "checks": checks}
+
+
 @app.get("/api/inventory", response_model=None)
 async def inventory() -> dict[str, Any] | JSONResponse:
     if SERVICE != "inventory":

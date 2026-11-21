@@ -6,5 +6,6 @@ __pycache__/
 *.egg-info/
 .env
 data/
+backups/
 logs/
 grafana/data/

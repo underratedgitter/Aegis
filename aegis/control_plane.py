@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
+import sqlite3
 import threading
 import time
 import uuid
@@ -41,6 +43,7 @@ from aegis.models import (
     Investigation,
     MetricSnapshot,
     OverviewResponse,
+    ReadyResponse,
     Runbook,
     ServiceStatus,
     TelemetryStatus,
@@ -162,10 +165,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        engine.stop()
-        telemetry.close()
-        remediation.close()
-        store.close()
+        # Stop the engine first so no background thread is writing when the database closes.
+        try:
+            engine.stop()
+        finally:
+            telemetry.close()
+            remediation.close()
+            store.close()
 
 
 app = FastAPI(title="Aegis SRE Copilot", version="0.3.0", lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
@@ -235,6 +241,29 @@ def index() -> FileResponse:
 @app.get("/healthz", response_model=HealthResponse)
 def healthz() -> HealthResponse:
     return HealthResponse(status="ok", service="aegis-control-plane")
+
+
+@app.get("/readyz", response_model=ReadyResponse)
+def readyz() -> ReadyResponse | JSONResponse:
+    """Readiness: 503 if the database or engine is broken; Prometheus/Loki only degrade it."""
+    checks = {"database": "ok", "engine": "ok" if engine.is_running else "stopped"}
+    try:
+        store.ping()
+    except sqlite3.Error:
+        logger.exception("readiness: database check failed")
+        checks["database"] = "error"
+    checks["prometheus"] = "ok" if _prometheus_status().available else "unavailable"
+    checks["loki"] = "ok" if telemetry.loki_status().available else "unavailable"
+    if checks["database"] != "ok" or checks["engine"] != "ok":
+        status = "unavailable"
+    elif "unavailable" in checks.values():
+        status = "degraded"
+    else:
+        status = "ok"
+    body = ReadyResponse(status=status, service="aegis-control-plane", checks=checks)
+    if status == "unavailable":
+        return JSONResponse(status_code=503, content=body.model_dump())
+    return body
 
 
 @app.get("/api/overview", response_model=OverviewResponse)

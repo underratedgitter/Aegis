@@ -159,8 +159,10 @@ Read endpoints are open. State-changing endpoints (`POST` routes and `GET /api/a
 ### Control plane
 
 ```bash
-# Liveness and current state
+# Liveness and readiness
 curl http://localhost:8000/healthz
+curl http://localhost:8000/readyz
+# Current state
 curl http://localhost:8000/api/overview
 
 # Force one engine evaluation
@@ -185,6 +187,8 @@ curl -X POST http://localhost:8000/api/incidents/<incident-id>/execute \
   -H 'content-type: application/json' -d '{"approver":"demo-operator"}'
 ```
 
+`GET /readyz` returns HTTP 503 (`status: unavailable`) when the SQLite database cannot be queried or the incident-engine thread has stopped. Prometheus and Loki being down only report `status: degraded` with HTTP 200, because Aegis can still serve and record incidents without them. Compose uses `/readyz` for the control plane and `/healthz` for the demo services.
+
 Other control-plane routes:
 - `POST /api/incidents/batch/approve` (requires key): Batch-approve all incidents in `recommendation_pending`.
 - `POST /api/chaos` (requires key): Inject bounded faults into demo services (`service`, `fault`, `duration_seconds`, `intensity`).
@@ -207,7 +211,8 @@ The control plane rate-limits each client (default 100 requests per 60 seconds; 
 
 Each demo service also exposes its own application and admin endpoints:
 
-- `GET /healthz` — Service liveness check.
+- `GET /healthz` — Service liveness check (no dependencies, always cheap).
+- `GET /readyz` — Readiness: `checks.dependency` reports whether the `DEPENDENCY_URL` service answers (`ok`/`unavailable`). A down dependency yields `status: degraded` but still HTTP 200.
 - `GET /metrics` — Prometheus metrics scrape target.
 - `GET /api/checkout` (Checkout: port 8080) — Process an order and call the inventory dependency.
 - `GET /api/inventory` (Inventory: port 8081) — Check inventory availability for the demo SKU.
@@ -242,7 +247,7 @@ PORT=8080 DEPENDENCY_URL=http://localhost:8081 python3 -m aegis.service_main
 python3 -m aegis.control_main
 ```
 
-Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), `AEGIS_API_KEY`, `AEGIS_RATE_LIMIT_MAX` (default `100`), `AEGIS_RATE_LIMIT_WINDOW` (default `60`), `AEGIS_AUTH_FAIL_MAX` (default `10`), `AEGIS_AUTH_FAIL_WINDOW` (default `60`), `AEGIS_MAX_BODY_BYTES` (default `65536`), and `AEGIS_CORS_ORIGINS` (default empty, same-origin only); see `aegis/settings.py` and [HTTP hardening](#http-hardening). Malformed values abort startup with an error naming the variable. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
+Each service and control-plane process listens on `PORT` (default 8000) on `AEGIS_HOST` (default `0.0.0.0`; use `127.0.0.1` when running locally outside a container). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), `AEGIS_API_KEY`, `AEGIS_RATE_LIMIT_MAX` (default `100`), `AEGIS_RATE_LIMIT_WINDOW` (default `60`), `AEGIS_AUTH_FAIL_MAX` (default `10`), `AEGIS_AUTH_FAIL_WINDOW` (default `60`), `AEGIS_MAX_BODY_BYTES` (default `65536`), and `AEGIS_CORS_ORIGINS` (default empty, same-origin only); see `aegis/settings.py` and [HTTP hardening](#http-hardening). Malformed values abort startup with an error naming the variable. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
 
 ## Reliability
 
@@ -256,6 +261,44 @@ The engine is built to keep running when its dependencies do not.
 - **Remediation failures are explicit.** A failed Execute records a `remediation_failed` event that says whether the target may have applied the request (for example after a read timeout), then returns the incident to `approved` so an operator can check and retry.
 
 These limits are constants in `aegis/telemetry.py`, `aegis/agent.py` and `aegis/remediation.py`.
+
+## Operations
+
+### Containers
+
+- The image runs as the unprivileged user `aegis` (uid 10001), installs runtime dependencies only, and has a built-in `HEALTHCHECK` on `/healthz`.
+- Compose runs the Aegis containers with a read-only root filesystem (`/tmp` is a tmpfs), all Linux capabilities dropped, `no-new-privileges`, an init process, rotated container logs (10 MB x 3), and `restart: unless-stopped`. Checkout waits for a healthy inventory; the control plane waits for all of its dependencies.
+- Third-party images are pinned to explicit versions in `docker-compose.yml`; bump them deliberately.
+- Upgrading an existing stack: volumes created by an earlier (root) image are not writable by uid 10001. Fix ownership once:
+
+  ```bash
+  docker compose run --rm --no-deps --user root --cap-add CHOWN control chown -R aegis:aegis /data /var/log/aegis
+  ```
+
+### Graceful shutdown
+
+On `SIGTERM` (`docker compose stop`/`down`) uvicorn drains open requests for up to 10 s, then the control plane stops the incident engine, waits up to 15 s for its in-flight evaluation and investigations, and only then closes the database (checkpointing the WAL). Compose allows 30 s (`stop_grace_period`) before `SIGKILL`.
+
+### Database and backups
+
+Incident history lives in SQLite at `AEGIS_DB_PATH` (Compose: the `aegis-data` volume at `/data`). It runs in WAL mode with `synchronous=NORMAL` and a 10 s busy timeout, so reads do not block the engine and brief lock contention is retried instead of failing.
+
+Back it up while the stack is running (do not copy the `.db` file by hand: with WAL it is incomplete without its `-wal` file):
+
+```bash
+make backup    # writes ./backups/aegis-<UTC timestamp>.db, integrity-checked
+```
+
+This uses SQLite's online backup API via `python -m aegis.backup_main [DEST]` (default destination: `backups/aegis-<timestamp>.db` next to `AEGIS_DB_PATH`; an existing file is never overwritten). Outside Docker, run the same command with `AEGIS_DB_PATH` set, or use `sqlite3 aegis.db ".backup 'copy.db'"`.
+
+Restore by stopping the control plane, replacing the database, and starting it again:
+
+```bash
+docker compose stop control
+docker compose run --rm --no-deps -v "$PWD/backups:/restore:ro" control sh -c \
+  'rm -f /data/aegis.db-wal /data/aegis.db-shm && cp /restore/aegis-<timestamp>.db /data/aegis.db'
+docker compose start control
+```
 
 ## Safety model and design decisions
 
