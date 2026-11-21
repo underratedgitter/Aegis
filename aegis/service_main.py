@@ -2,8 +2,9 @@ import os
 
 import uvicorn
 
-# Must stay below the orchestrator's stop timeout (docker compose: stop_grace_period).
-SHUTDOWN_TIMEOUT_SECONDS = 20
+# Time to drain open connections on SIGTERM; with the engine join (15s) it must stay
+# below the orchestrator's stop timeout (docker compose: stop_grace_period 30s).
+SHUTDOWN_TIMEOUT_SECONDS = 10
 
 if __name__ == "__main__":
     uvicorn.run(
