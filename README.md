@@ -236,6 +236,19 @@ python3 -m aegis.control_main
 
 Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), and `AEGIS_API_KEY`; see `aegis/settings.py`. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
 
+## Reliability
+
+The engine is built to keep running when its dependencies do not.
+
+- **Timeouts and retries.** Prometheus queries use a 1 s connect and 3 s read timeout. They are idempotent reads, so transport errors and HTTP 429/502/503/504 are retried up to 3 attempts in total, with 0.25 s then 0.5 s backoff. After a query exhausts its retries, further Prometheus queries fail fast for 10 s instead of each waiting out the full retry budget. The services' admin API (remediation) uses a 2 s connect and 5 s read timeout and is never retried automatically, because it changes state.
+- **Outages do not close incidents.** If a rule's Prometheus query fails, the engine skips it: the anomaly baseline is not updated, no healthy cycle is counted, and the incident gets one `telemetry_unavailable` event. Incidents only auto-resolve after consecutive successful, below-threshold readings.
+- **One failure does not stop the loop.** Each rule is evaluated independently; engine errors are logged (with traceback) and the next cycle runs after `AEGIS_POLL_SECONDS` (minimum 1 s). A crashed investigation records an `agent_error` event and returns the incident to `open`. Incidents left in `investigating` by a restart are investigated again at startup.
+- **Bounded LLM investigator.** With `OPENAI_API_KEY` set, each request times out after 20 s (one SDK retry), the whole investigation has a 60 s budget, at most 6 tool rounds with 8 tool calls each, tool results are cut to 8,000 characters and the whole prompt to 60,000. Any breach, malformed answer, or recommendation outside the remediation allowlist falls back to the local investigator, and the reason is stored as `fallback_reason`. Tool errors are returned to the model rather than aborting.
+- **No lost updates.** Investigation results, approvals and remediation results are merged into the incident under the store lock, so evidence appended while they run is kept, and two concurrent approvals cannot both succeed (the second gets HTTP 409).
+- **Remediation failures are explicit.** A failed Execute records a `remediation_failed` event that says whether the target may have applied the request (for example after a read timeout), then returns the incident to `approved` so an operator can check and retry.
+
+These limits are constants in `aegis/telemetry.py`, `aegis/agent.py` and `aegis/remediation.py`.
+
 ## Safety model and design decisions
 
 1. The agent is a copilot, not a captain. Recommendations are auditable proposals; execution requires a named approver and a second API call.
