@@ -195,6 +195,14 @@ Other control-plane routes:
 
 The control plane rate-limits each client (default 100 requests per 60 seconds; configurable via `AEGIS_RATE_LIMIT_MAX` and `AEGIS_RATE_LIMIT_WINDOW`).
 
+#### HTTP hardening
+
+- **Failed-key lockout:** a client that presents a wrong bearer token `AEGIS_AUTH_FAIL_MAX` times (default 10) within `AEGIS_AUTH_FAIL_WINDOW` seconds (default 60) receives `429` with a `Retry-After` header on protected routes, even if it then sends the right key. Requests with no token are not counted. The counters are in memory and per process, keyed by the TCP peer address; behind a reverse proxy every client shares the proxy's address, so apply per-client limits at the proxy as well. The demo services' admin routes use the same lockout.
+- **Request size:** bodies larger than `AEGIS_MAX_BODY_BYTES` (default 65536) are refused with `413`, whether declared by `Content-Length` or streamed. `approver` must be 2-80 plain characters (letters, digits, space, `. _ @ + -`), and request bodies reject unknown fields.
+- **Security headers:** every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and a `Content-Security-Policy` (`default-src 'self'`, no external origins, inline handlers only via `script-src-attr`; `/docs` and `/redoc` get a relaxed policy so Swagger UI can load from jsDelivr; the demo services send `default-src 'none'`). `Strict-Transport-Security` is added when the request arrived over HTTPS, so terminate TLS in front of Aegis for anything beyond localhost.
+- **CORS:** disabled by default, so browsers only allow same-origin use (the bundled control room needs nothing). To let another web origin call the API, set `AEGIS_CORS_ORIGINS` to a comma-separated list of origins such as `https://ops.example.com,http://localhost:3000`. Wildcards and paths are rejected, credentials are never allowed, and only `GET`/`POST` with the `Authorization`, `Content-Type` and `X-Request-Id` headers are permitted.
+- **Startup checks:** invalid configuration (a non-integer or out-of-range number, a malformed URL or port, a bad CORS origin) stops the process at startup with a message listing every problem, instead of silently falling back to a default. When `AEGIS_API_KEY` is unset the demo still runs, but a `SECURITY WARNING` is logged on every start: approve, execute, investigate and audit routes are then open to anyone who can reach the port. Always set a key for a shared or production deployment.
+
 ### Demo services (Checkout & Inventory)
 
 Each demo service also exposes its own application and admin endpoints:
@@ -234,7 +242,7 @@ PORT=8080 DEPENDENCY_URL=http://localhost:8081 python3 -m aegis.service_main
 python3 -m aegis.control_main
 ```
 
-Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), and `AEGIS_API_KEY`; see `aegis/settings.py`. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
+Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), `AEGIS_API_KEY`, `AEGIS_RATE_LIMIT_MAX` (default `100`), `AEGIS_RATE_LIMIT_WINDOW` (default `60`), `AEGIS_AUTH_FAIL_MAX` (default `10`), `AEGIS_AUTH_FAIL_WINDOW` (default `60`), `AEGIS_MAX_BODY_BYTES` (default `65536`), and `AEGIS_CORS_ORIGINS` (default empty, same-origin only); see `aegis/settings.py` and [HTTP hardening](#http-hardening). Malformed values abort startup with an error naming the variable. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
 
 ## Safety model and design decisions
 

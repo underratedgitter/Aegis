@@ -31,6 +31,14 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_lockout_state():
+    """Failed attempts from one test must not lock out the next."""
+    control_plane._auth_failures.reset()
+    yield
+    control_plane._auth_failures.reset()
+
+
 @pytest.fixture
 def with_api_key(monkeypatch):
     """Configure a key the way AEGIS_API_KEY would at startup."""
