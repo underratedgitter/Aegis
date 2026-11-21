@@ -21,6 +21,7 @@ if [[ -z "${AEGIS_API_KEY:-}" ]]; then
 fi
 
 grafana_port="${GRAFANA_PORT:-3001}"
+checkout_port="${CHECKOUT_PORT:-8080}"
 open_browser="${OPEN_BROWSER:-1}"
 auto_start_docker="${AUTO_START_DOCKER:-1}"
 
@@ -67,6 +68,18 @@ if [[ -z "${GRAFANA_PORT:-}" ]]; then
   fi
 fi
 
+if [[ -z "${CHECKOUT_PORT:-}" ]]; then
+  original_checkout_port="$checkout_port"
+  while port_in_use "$checkout_port"; do
+    checkout_port=$((checkout_port + 1))
+  done
+
+  if [[ "$checkout_port" != "$original_checkout_port" ]]; then
+    export CHECKOUT_PORT="$checkout_port"
+    echo "Checkout port ${original_checkout_port} is busy; using ${checkout_port}."
+  fi
+fi
+
 echo "Starting the Aegis stack..."
 docker compose up --build -d
 
@@ -74,7 +87,7 @@ urls=(
   "http://localhost:8000"
   "http://localhost:${grafana_port}"
   "http://localhost:9091"
-  "http://localhost:8080"
+  "http://localhost:${checkout_port}"
   "http://localhost:8081"
 )
 

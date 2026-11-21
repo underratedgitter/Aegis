@@ -62,7 +62,7 @@ and opens the local pages automatically. Published ports bind to `127.0.0.1` by 
 - Aegis control room: <http://localhost:8000>
 - Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied; default credentials: `admin` / `admin`)
 - Prometheus: <http://localhost:9091>
-- Checkout: <http://localhost:8080>
+- Checkout: <http://localhost:8080> (or the next free port if 8080 is occupied)
 - Inventory: <http://localhost:8081>
 
 On macOS, you can also double-click [`start.command`](start.command) to run the same startup
@@ -75,6 +75,9 @@ Grafana port. You can also choose one explicitly without changing the other serv
 GRAFANA_PORT=3002 make start
 ```
 
+The checkout port (8080) is handled the same way: `make start` picks the next free port, or set
+`CHECKOUT_PORT=8082 make start`.
+
 Fault injection, approval, and execution are protected by a shared `AEGIS_API_KEY`. If none is set,
 `make start` generates one and appends it to `.env`. Paste it into the control room's **API key**
 box before using the action buttons; the key is kept in the browser's session storage. Without a
@@ -86,7 +89,7 @@ The control room is the recommended demo surface. If you want traffic before inj
 python3 scripts/smoke.py --count 100
 ```
 
-`scripts/smoke.py` defaults to `--checkout-url http://localhost:8080` and `--count 20`.
+`scripts/smoke.py` defaults to `--checkout-url http://localhost:$CHECKOUT_PORT` (8080 when unset) and `--count 20`.
 
 Or inject a failure from a terminal, passing the key from `.env`:
 
