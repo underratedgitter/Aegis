@@ -20,11 +20,20 @@ x-aegis-hardening: &aegis-hardening
   stop_grace_period: 30s
   logging: *default-logging
 
+# Hardening settings read by every Aegis process; the defaults match aegis/settings.py.
+x-aegis-security-env: &aegis-security-env
+  AEGIS_CORS_ORIGINS: ${AEGIS_CORS_ORIGINS:-}
+  AEGIS_AUTH_FAIL_MAX: ${AEGIS_AUTH_FAIL_MAX:-10}
+  AEGIS_AUTH_FAIL_WINDOW: ${AEGIS_AUTH_FAIL_WINDOW:-60}
+  AEGIS_MAX_BODY_BYTES: ${AEGIS_MAX_BODY_BYTES:-65536}
+
 services:
   control:
     build: .
     command: python -m aegis.control_main
     environment:
+      <<: *aegis-security-env
+      AEGIS_SIGNAL_EVENT_INTERVAL: ${AEGIS_SIGNAL_EVENT_INTERVAL:-60}
       PROMETHEUS_URL: http://prometheus:9090
       LOKI_URL: http://loki:3100
       CHECKOUT_URL: http://checkout:8000
@@ -67,6 +76,7 @@ services:
     build: .
     command: python -m aegis.service_main
     environment:
+      <<: *aegis-security-env
       SERVICE_NAME: checkout
       DEPENDENCY_URL: http://inventory:8000
       LOG_PATH: /var/log/aegis/checkout.jsonl
@@ -96,6 +106,7 @@ services:
     build: .
     command: python -m aegis.service_main
     environment:
+      <<: *aegis-security-env
       SERVICE_NAME: inventory
       LOG_PATH: /var/log/aegis/inventory.jsonl
       AEGIS_API_KEY: ${AEGIS_API_KEY:-}
