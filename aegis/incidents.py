@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +24,10 @@ from aegis.storage import Store, utc_now
 if TYPE_CHECKING:
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
+
+logger = logging.getLogger(__name__)
+
+SHUTDOWN_JOIN_SECONDS = 15.0
 
 # ─── Alert Rules ──────────────────────────────────────────────────────────────
 
@@ -72,6 +78,8 @@ class IncidentEngine:
         self.agent = AgentInvestigator(settings, store, telemetry)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._investigations: set[threading.Thread] = set()
+        self._investigations_lock = threading.Lock()
         self._misses: dict[str, int] = {}
 
     def start(self) -> None:
@@ -84,11 +92,27 @@ class IncidentEngine:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the incident detection engine."""
+    @property
+    def is_running(self) -> bool:
+        """Whether the background evaluation thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self, timeout: float = SHUTDOWN_JOIN_SECONDS) -> None:
+        """Stop the engine and wait up to `timeout` seconds for its work to finish.
+
+        Waits for the evaluation loop and any in-flight investigations so the caller
+        can close the database afterwards without those threads still writing to it.
+        """
         self._stop.set()
+        deadline = time.monotonic() + timeout
+        with self._investigations_lock:
+            workers = [*self._investigations]
         if self._thread:
-            self._thread.join(timeout=2)
+            workers.append(self._thread)
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(worker.is_alive() for worker in workers):
+            logger.warning("incident engine still busy after %.0fs; shutting down anyway", timeout)
 
     def _run(self) -> None:
         """Main engine loop."""
@@ -148,15 +172,25 @@ class IncidentEngine:
                 self.store.add_event(
                     incident["id"], "investigation_started", "Aegis is collecting evidence"
                 )
-                threading.Thread(
-                    target=self._investigate,
-                    args=(incident["id"],),
-                    name=f"investigate-{incident['id']}",
-                    daemon=True,
-                ).start()
+                self._spawn_investigation(incident["id"])
 
         self._resolve_missing(fired_ids)
         return fired
+
+    def _spawn_investigation(self, incident_id: str) -> None:
+        """Investigate in a background thread that `stop()` can wait for."""
+
+        def work() -> None:
+            try:
+                self._investigate(incident_id)
+            finally:
+                with self._investigations_lock:
+                    self._investigations.discard(threading.current_thread())
+
+        worker = threading.Thread(target=work, name=f"investigate-{incident_id}", daemon=True)
+        with self._investigations_lock:
+            self._investigations.add(worker)
+        worker.start()
 
     def _investigate(self, incident_id: str) -> None:
         """Run agent investigation in a background thread."""

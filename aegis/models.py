@@ -124,6 +124,14 @@ class HealthResponse(BaseModel):
     service: str
 
 
+class ReadyResponse(BaseModel):
+    """Readiness: "ok", "degraded" (optional dependency down), or "unavailable" (HTTP 503)."""
+
+    status: str
+    service: str
+    checks: dict[str, str]
+
+
 class ServiceStatus(BaseModel):
     name: str
     available: bool

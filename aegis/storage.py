@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+BUSY_TIMEOUT_MS = 10_000
+
 
 def utc_now() -> str:
     """Return current UTC time as ISO format string."""
@@ -22,9 +24,27 @@ class Store:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.max_evidence = max(1, max_evidence)  # [-0:] would keep everything
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        self.db = sqlite3.connect(
+            path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000
+        )
         self.db.row_factory = sqlite3.Row
+        self._configure()
         self._initialize_schema()
+
+    def _configure(self) -> None:
+        """Enable WAL so readers do not block the writer, and wait out brief lock contention.
+
+        WAL with synchronous=NORMAL cannot corrupt the database on a crash; at worst the
+        last transactions before a power loss are rolled back.
+        """
+        self.db.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = NORMAL")
+
+    def ping(self) -> None:
+        """Raise sqlite3.Error if the database cannot be queried."""
+        with self.lock:
+            self.db.execute("SELECT 1").fetchone()
 
     def _initialize_schema(self) -> None:
         """Create database tables if they don't exist."""
@@ -254,5 +274,41 @@ class Store:
             return durations
 
     def close(self) -> None:
-        """Close the database connection."""
-        self.db.close()
+        """Close the database connection, checkpointing the WAL into the main file."""
+        with self.lock:
+            self.db.close()
+
+
+def backup_database(source: str, dest: str) -> str:
+    """Write a consistent copy of a live database using SQLite's online backup API.
+
+    Unlike copying the file, this is safe while the control plane is writing and
+    includes uncheckpointed WAL content. The copy is integrity-checked before returning.
+
+    Raises:
+        FileNotFoundError: the source database does not exist.
+        FileExistsError: the destination already exists (it is never overwritten).
+        sqlite3.Error: the copy failed or did not pass the integrity check.
+    """
+    if not Path(source).is_file():
+        raise FileNotFoundError(f"database not found: {source}")
+    if Path(dest).exists():
+        raise FileExistsError(f"refusing to overwrite existing file: {dest}")
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(source, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        copy = sqlite3.connect(dest)
+        try:
+            src.backup(copy)
+            result = copy.execute("PRAGMA integrity_check").fetchone()[0]
+            if result != "ok":
+                raise sqlite3.DatabaseError(f"backup failed integrity check: {result}")
+        except sqlite3.Error:
+            copy.close()
+            Path(dest).unlink(missing_ok=True)
+            raise
+        finally:
+            copy.close()
+    finally:
+        src.close()
+    return dest
