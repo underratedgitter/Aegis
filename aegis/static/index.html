@@ -3,79 +3,292 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0e14">
   <title>Aegis · AI SRE Copilot</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0e14'/%3E%3Cpath d='M16 5l9 4v7c0 5-4 9-9 11-5-2-9-6-9-11V9z' fill='none' stroke='%235eead4' stroke-width='2.4' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand"><span class="mark">✦</span><span>Aegis</span><small>AI SRE copilot</small></div>
-    <div class="topbar-actions"><input id="api-key" type="password" placeholder="API key" autocomplete="off" aria-label="API key"><span id="engine-status" class="pill muted">connecting</span><button id="refresh">Refresh</button></div>
-  </header>
-  <main class="shell">
-    <section class="hero">
-      <div>
-        <p class="eyebrow">Production control room</p>
-        <h1>Stay ahead of the incident.</h1>
-        <p class="subhead">Telemetry, evidence, and human-approved remediation in one loop.</p>
-      </div>
-      <div class="hero-note"><span class="pulse"></span><span id="last-updated">Loading live state…</span></div>
-    </section>
+  <a class="skip-link" href="#main">Skip to content</a>
 
-    <section class="stat-grid">
-      <article class="stat-card"><span>Open incidents</span><strong id="open-incidents">—</strong><small>correlated by root cause</small></article>
-      <article class="stat-card"><span>MTTR</span><strong id="mttr">—</strong><small>resolved incidents</small></article>
-      <article class="stat-card"><span>Telemetry</span><strong id="telemetry">—</strong><small>Prometheus · Loki</small></article>
-      <article class="stat-card"><span>Demo services</span><strong id="services">—</strong><small>checkout · inventory</small></article>
-      <article class="stat-card"><span>Error budget</span><strong id="error-budget">—</strong><small>checkout · rolling 30m</small></article>
-    </section>
+  <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.2 7.8-8 9-4.8-1.2-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></symbol>
+    <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-incidents" viewBox="0 0 24 24"><path d="M12 3.5L2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17.5h.01"/></symbol>
+    <symbol id="i-chaos" viewBox="0 0 24 24"><path d="M13 2.5L4.5 13.5H11l-1 8 8.5-11H12z"/></symbol>
+    <symbol id="i-telemetry" viewBox="0 0 24 24"><path d="M3 12h4l3-7.5 4 15 3-7.5h4"/></symbol>
+    <symbol id="i-runbooks" viewBox="0 0 24 24"><path d="M5 4.5h10a3 3 0 0 1 3 3v12H8a3 3 0 0 1-3-3z"/><path d="M5 16.5a3 3 0 0 1 3-3h10M9 8h5"/></symbol>
+    <symbol id="i-audit" viewBox="0 0 24 24"><path d="M9 3.5h6l1 2h3v15H5v-15h3z"/><path d="M9 11h6M9 15h6"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h9M19 7h1M4 17h1M11 17h9"/><circle cx="16" cy="7" r="2.5"/><circle cx="8" cy="17" r="2.5"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.3-4.5L4 8.5M4 4v4.5h4.5M4 13a8 8 0 0 0 14.3 4.5l1.7-2M20 20v-4.5h-4.5"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3M14 9l2 2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5h.01"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5l12 7.5-12 7.5z"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3.5 13l2.5-8h12l2.5 8v6h-17z"/><path d="M3.5 13H9a3 3 0 0 0 6 0h5.5"/></symbol>
+  </svg>
 
-    <section class="workspace">
-      <aside class="panel incident-panel">
-        <div class="panel-heading"><div><p class="eyebrow">Live queue</p><h2>Incidents</h2></div><span id="incident-count" class="count">0</span></div>
-        <div class="filter-bar">
-          <input id="incident-search" type="text" placeholder="Search incidents…" />
-          <select id="incident-status-filter">
-            <option value="">All statuses</option>
-            <option value="open">Open</option>
-            <option value="investigating">Investigating</option>
-            <option value="recommendation_pending">Pending</option>
-            <option value="approved">Approved</option>
-            <option value="executing">Executing</option>
-            <option value="resolved">Resolved</option>
-          </select>
-          <select id="incident-severity-filter">
-            <option value="">All severities</option>
-            <option value="high">High</option>
-            <option value="medium">Medium</option>
-            <option value="low">Low</option>
-          </select>
-        </div>
-        <div id="incident-list" class="incident-list"><div class="empty">No incidents yet.<br><span>Use the chaos controls below to create one.</span></div></div>
-        <div class="panel-actions">
-          <button class="secondary small" onclick="batchApprove()">Batch Approve</button>
-          <button class="secondary small" onclick="exportIncidents('json')">Export JSON</button>
-          <button class="secondary small" onclick="exportIncidents('csv')">Export CSV</button>
-        </div>
-      </aside>
+  <div class="app">
+    <header class="sidebar">
+      <a class="brand" href="#/overview" aria-label="Aegis, go to overview">
+        <span class="brand-mark"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-shield"/></svg></span>
+        <span class="brand-text"><strong>Aegis</strong><small>AI SRE copilot</small></span>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <ul>
+          <li><a href="#/overview" data-route="overview"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-overview"/></svg><span>Overview</span></a></li>
+          <li><a href="#/incidents" data-route="incidents"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-incidents"/></svg><span>Incidents</span><span id="nav-open" class="nav-badge" hidden>0</span></a></li>
+          <li><a href="#/chaos" data-route="chaos"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-chaos"/></svg><span>Chaos lab</span></a></li>
+          <li><a href="#/telemetry" data-route="telemetry"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-telemetry"/></svg><span>Telemetry</span></a></li>
+          <li><a href="#/runbooks" data-route="runbooks"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-runbooks"/></svg><span>Runbooks</span></a></li>
+          <li><a href="#/audit" data-route="audit"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-audit"/></svg><span>Audit log</span></a></li>
+          <li><a href="#/settings" data-route="settings"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-settings"/></svg><span>Settings</span></a></li>
+        </ul>
+      </nav>
+      <p class="sidebar-foot">Human-approved remediation.<br>Evidence first.</p>
+    </header>
 
-      <section class="panel detail-panel">
-        <div id="detail-empty" class="empty detail-empty"><div class="empty-icon">⌁</div><h2>Select an incident</h2><p>The agent's investigation trail and recommendation will appear here.</p></div>
-        <div id="detail" class="hidden">
-          <div class="detail-heading"><div><div id="detail-severity"></div><h2 id="detail-title"></h2><p id="detail-meta"></p></div><span id="detail-status" class="status"></span></div>
-          <div id="recommendation-card" class="recommendation-card"></div>
-          <div class="columns">
-            <div><p class="eyebrow">Agent investigation</p><div id="hypothesis" class="hypothesis"></div><div id="evidence" class="evidence"></div></div>
-            <div><p class="eyebrow">Timeline</p><div id="timeline" class="timeline"></div></div>
+    <div class="content">
+      <main id="main">
+        <div class="topbar">
+          <div class="topbar-title">
+            <p id="page-eyebrow" class="eyebrow">Production control room</p>
+            <h1 id="page-title" tabindex="-1">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <span id="engine-status" class="pill pill-muted" role="status">connecting</span>
+            <span id="last-updated" class="updated">Loading…</span>
+            <button type="button" class="btn btn-ghost btn-icon" data-action="refresh" aria-label="Refresh data" title="Refresh data"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg></button>
+            <a id="key-chip" class="btn btn-ghost" href="#/settings" title="API key settings"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-key"/></svg><span id="key-chip-text">No key</span></a>
           </div>
         </div>
-      </section>
-    </section>
 
-    <section class="lower-grid">
-      <article class="panel telemetry-panel"><div class="panel-heading"><div><p class="eyebrow">Signals</p><h2>Metric snapshot</h2></div><span class="live-dot">LIVE</span></div><div id="metrics" class="metrics"></div></article>
-      <article class="panel chaos-panel"><div class="panel-heading"><div><p class="eyebrow">Controlled chaos</p><h2>Break production</h2></div></div><p class="panel-copy">Inject a bounded failure. Aegis detects it, gathers evidence, and proposes a safe fix.</p><div class="chaos-form"><select id="chaos-service"><option value="inventory">inventory</option><option value="checkout">checkout</option></select><select id="chaos-fault"><option value="dependency">dependency failure</option><option value="latency">latency spike</option><option value="errors">5xx errors</option><option value="cpu">CPU stress</option></select><input id="chaos-duration" type="number" min="5" value="60"><button id="inject">Inject fault</button></div><div id="chaos-result" class="form-result"></div></article>
-    </section>
-  </main>
+        <section id="view-overview" class="view" aria-labelledby="page-title" hidden>
+          <div class="kpi-grid">
+            <article class="kpi"><span class="kpi-label">Open incidents</span><strong id="kpi-open" class="kpi-value">—</strong><small>correlated by root cause</small></article>
+            <article class="kpi"><span class="kpi-label">MTTR</span><strong id="kpi-mttr" class="kpi-value">—</strong><small id="kpi-mttr-sub">resolved incidents</small></article>
+            <article class="kpi"><span class="kpi-label">Telemetry</span><strong id="kpi-telemetry" class="kpi-value">—</strong><small>Prometheus · Loki</small></article>
+            <article class="kpi"><span class="kpi-label">Demo services</span><strong id="kpi-services" class="kpi-value">—</strong><small>checkout · inventory</small></article>
+            <article class="kpi"><span class="kpi-label">Error budget</span><strong id="kpi-budget" class="kpi-value">—</strong><small id="kpi-budget-sub">checkout · rolling 30m</small></article>
+          </div>
+          <div class="grid-2">
+            <section class="panel" aria-labelledby="ov-metrics-h">
+              <div class="panel-head"><div><p class="eyebrow">Signals</p><h2 id="ov-metrics-h">Metric snapshot</h2></div><span class="live"><i class="live-dot"></i>LIVE</span></div>
+              <div id="ov-metrics" class="panel-body panel-body-metrics"></div>
+            </section>
+            <section class="panel" aria-labelledby="ov-health-h">
+              <div class="panel-head"><div><p class="eyebrow">Platform</p><h2 id="ov-health-h">Health and SLO</h2></div></div>
+              <div id="ov-health" class="panel-body panel-body-health"></div>
+            </section>
+          </div>
+          <section class="panel" aria-labelledby="ov-incidents-h">
+            <div class="panel-head"><div><p class="eyebrow">Latest activity</p><h2 id="ov-incidents-h">Recent incidents</h2></div><a class="btn btn-ghost btn-sm" href="#/incidents">View all</a></div>
+            <div id="ov-incidents" class="panel-body panel-body-recent"></div>
+          </section>
+        </section>
+
+        <section id="view-incidents" class="view incidents-layout" aria-labelledby="page-title" hidden>
+          <section class="panel list-panel" aria-labelledby="inc-list-h">
+            <h2 id="inc-list-h" class="sr-only">Incident list</h2>
+            <div class="filters" role="search">
+              <div class="search-field"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-search"/></svg><input id="inc-search" type="search" placeholder="Search title, id, root cause" aria-label="Search incidents" autocomplete="off"></div>
+              <div class="filter-row">
+                <select id="inc-status" aria-label="Filter by status">
+                  <option value="">All statuses</option>
+                  <option value="open">Open</option>
+                  <option value="investigating">Investigating</option>
+                  <option value="recommendation_pending">Pending approval</option>
+                  <option value="approved">Approved</option>
+                  <option value="executing">Executing</option>
+                  <option value="resolved">Resolved</option>
+                  <option value="closed">Closed</option>
+                </select>
+                <select id="inc-severity" aria-label="Filter by severity">
+                  <option value="">All severities</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+            </div>
+            <div class="list-toolbar">
+              <span id="inc-count" class="muted">0 incidents</span>
+              <div class="toolbar-actions">
+                <button type="button" id="batch-approve" class="btn btn-sm" data-action="batch-approve" disabled>Approve pending</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-action="export" data-format="json" title="Download all incidents as JSON"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-download"/></svg>JSON</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-action="export" data-format="csv" title="Download all incidents as CSV"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-download"/></svg>CSV</button>
+              </div>
+            </div>
+            <div id="incident-list" class="incident-list"></div>
+          </section>
+          <section class="panel detail-panel" aria-label="Incident detail">
+            <div id="detail"></div>
+          </section>
+        </section>
+
+        <section id="view-chaos" class="view" aria-labelledby="page-title" hidden>
+          <div class="grid-2 grid-chaos">
+            <section class="panel" aria-labelledby="chaos-h">
+              <div class="panel-head"><div><p class="eyebrow">Controlled chaos</p><h2 id="chaos-h">Inject a fault</h2></div></div>
+              <form id="chaos-form" class="panel-body form-stack" novalidate>
+                <p class="muted">Inject a bounded failure. Aegis detects it, gathers evidence, and proposes a safe fix. Fault injection needs an API key configured on the control plane.</p>
+                <fieldset class="choice-group">
+                  <legend>Target service</legend>
+                  <label class="choice"><input type="radio" name="service" value="inventory" checked><span class="choice-body"><strong>inventory</strong><small>Stock lookups used by checkout</small></span></label>
+                  <label class="choice"><input type="radio" name="service" value="checkout"><span class="choice-body"><strong>checkout</strong><small>Customer-facing order flow</small></span></label>
+                </fieldset>
+                <fieldset class="choice-group choice-group-4">
+                  <legend>Fault type</legend>
+                  <label class="choice"><input type="radio" name="fault" value="dependency" checked><span class="choice-body"><strong>Dependency failure</strong><small>Upstream calls fail with 5xx</small></span></label>
+                  <label class="choice"><input type="radio" name="fault" value="latency"><span class="choice-body"><strong>Latency spike</strong><small>Responses slow down</small></span></label>
+                  <label class="choice"><input type="radio" name="fault" value="errors"><span class="choice-body"><strong>5xx errors</strong><small>Requests return server errors</small></span></label>
+                  <label class="choice"><input type="radio" name="fault" value="cpu"><span class="choice-body"><strong>CPU stress</strong><small>Burn CPU on the service</small></span></label>
+                </fieldset>
+                <div class="field-row">
+                  <label class="field"><span>Duration (seconds)</span><input id="chaos-duration" name="duration" type="number" min="5" max="900" step="5" value="60" inputmode="numeric"></label>
+                  <label class="field"><span>Intensity</span><input id="chaos-intensity" name="intensity" type="number" min="0.1" max="10" step="0.1" value="1" inputmode="decimal"></label>
+                </div>
+                <div class="form-actions"><button type="submit" id="chaos-submit" class="btn btn-danger"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-chaos"/></svg>Inject fault</button><span id="chaos-hint" class="muted" role="status"></span></div>
+              </form>
+            </section>
+            <section class="panel" aria-labelledby="chaos-log-h">
+              <div class="panel-head"><div><p class="eyebrow">This session</p><h2 id="chaos-log-h">Injections</h2></div></div>
+              <div id="chaos-history" class="panel-body"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-telemetry" class="view" aria-labelledby="page-title" hidden>
+          <div class="grid-2 grid-telemetry">
+            <section class="panel" aria-labelledby="tel-metrics-h">
+              <div class="panel-head"><div><p class="eyebrow">Prometheus</p><h2 id="tel-metrics-h">Metrics</h2></div><span class="live"><i class="live-dot"></i>LIVE</span></div>
+              <div id="tel-metrics" class="panel-body panel-body-tel"></div>
+            </section>
+            <section class="panel" aria-labelledby="tel-sources-h">
+              <div class="panel-head"><div><p class="eyebrow">Backends</p><h2 id="tel-sources-h">Sources</h2></div></div>
+              <div id="tel-sources" class="panel-body"></div>
+            </section>
+          </div>
+          <section class="panel" aria-labelledby="logs-h">
+            <div class="panel-head"><div><p class="eyebrow">Structured logs</p><h2 id="logs-h">Recent logs</h2></div><span id="log-count" class="count">0</span></div>
+            <div class="filters filters-inline" role="search">
+              <div class="search-field"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-search"/></svg><input id="log-search" type="search" placeholder="Filter messages" aria-label="Filter log messages" autocomplete="off"></div>
+              <select id="log-service" aria-label="Service">
+                <option value="">All services</option>
+                <option value="checkout">checkout</option>
+                <option value="inventory">inventory</option>
+              </select>
+              <select id="log-level" aria-label="Level">
+                <option value="">All levels</option>
+                <option value="error">error</option>
+                <option value="warning">warning</option>
+                <option value="info">info</option>
+              </select>
+              <select id="log-limit" aria-label="Number of lines">
+                <option value="40">40 lines</option>
+                <option value="100">100 lines</option>
+                <option value="200">200 lines</option>
+              </select>
+            </div>
+            <div id="logs" class="logs" tabindex="0" role="region" aria-label="Log lines"></div>
+          </section>
+        </section>
+
+        <section id="view-runbooks" class="view" aria-labelledby="page-title" hidden>
+          <section class="panel" aria-labelledby="rb-h">
+            <div class="panel-head"><div><p class="eyebrow">Available</p><h2 id="rb-h">Runbooks</h2></div><span id="rb-count" class="count">0</span></div>
+            <p class="panel-intro muted">The agent reads these runbooks as evidence while it investigates. Incidents that cited a runbook are linked below.</p>
+            <div id="runbooks" class="panel-body panel-body-runbooks"></div>
+          </section>
+        </section>
+
+        <section id="view-audit" class="view" aria-labelledby="page-title" hidden>
+          <section class="panel" aria-labelledby="audit-h">
+            <div class="panel-head"><div><p class="eyebrow">Recorded actions</p><h2 id="audit-h">Audit log</h2></div><span id="audit-count" class="count">0</span></div>
+            <div class="filters filters-inline">
+              <select id="audit-action" aria-label="Filter by action"><option value="">All actions</option></select>
+              <select id="audit-limit" aria-label="Number of entries">
+                <option value="50">Last 50</option>
+                <option value="100">Last 100</option>
+                <option value="200">Last 200</option>
+              </select>
+              <span class="muted filter-note">Held in memory by the control plane; cleared on restart.</span>
+            </div>
+            <div id="audit" class="panel-body panel-body-audit"></div>
+          </section>
+        </section>
+
+        <section id="view-settings" class="view" aria-labelledby="page-title" hidden>
+          <div class="grid-2">
+            <section class="panel" aria-labelledby="set-key-h">
+              <div class="panel-head"><div><p class="eyebrow">Access</p><h2 id="set-key-h">API key and operator</h2></div></div>
+              <form id="key-form" class="panel-body form-stack">
+                <p class="muted">Needed for approve, execute, investigate, chaos, run-once and the audit log when the control plane has AEGIS_API_KEY set. The key is kept in this tab's session storage only and sent as a bearer token.</p>
+                <label class="field"><span>API key</span><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste AEGIS_API_KEY"></label>
+                <label class="field"><span>Approver name</span><input id="approver" type="text" autocomplete="off" spellcheck="false" maxlength="80" placeholder="demo-operator"><small class="hint">Recorded on approvals and executions. Letters, digits, space and . _ @ + -</small></label>
+                <div class="form-actions">
+                  <button type="submit" class="btn">Save</button>
+                  <button type="button" class="btn btn-ghost" data-action="clear-key">Clear key</button>
+                  <span id="key-status" class="muted" role="status"></span>
+                </div>
+              </form>
+            </section>
+            <section class="panel" aria-labelledby="set-engine-h">
+              <div class="panel-head"><div><p class="eyebrow">Detection</p><h2 id="set-engine-h">Engine</h2></div></div>
+              <div class="panel-body form-stack">
+                <p class="muted">The engine evaluates alert rules on a timer. Run a cycle now to evaluate them immediately and see which rules fired.</p>
+                <div class="form-actions"><button type="button" id="run-once" class="btn" data-action="run-once"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-play"/></svg>Run detection cycle</button></div>
+                <div id="run-once-result" class="result-box"></div>
+              </div>
+            </section>
+            <section class="panel" aria-labelledby="set-health-h">
+              <div class="panel-head"><div><p class="eyebrow">Diagnostics</p><h2 id="set-health-h">System health</h2></div></div>
+              <div id="set-health" class="panel-body"></div>
+            </section>
+            <section class="panel" aria-labelledby="set-prefs-h">
+              <div class="panel-head"><div><p class="eyebrow">Preferences</p><h2 id="set-prefs-h">Display and docs</h2></div></div>
+              <div class="panel-body form-stack">
+                <label class="check"><input id="auto-refresh" type="checkbox" checked><span>Refresh data automatically every 5 seconds</span></label>
+                <p class="links"><a class="btn btn-ghost btn-sm" href="/docs" target="_blank" rel="noopener">API docs (Swagger)</a><a class="btn btn-ghost btn-sm" href="/redoc" target="_blank" rel="noopener">ReDoc</a></p>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <form method="dialog">
+      <h2 id="confirm-title">Confirm</h2>
+      <div id="confirm-body" class="dialog-body"></div>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" id="confirm-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="submit" value="confirm" id="confirm-ok" class="btn">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="key-dialog" class="dialog" aria-labelledby="key-title" aria-describedby="key-body">
+    <form method="dialog" id="key-dialog-form">
+      <h2 id="key-title">API key required</h2>
+      <p id="key-body" class="dialog-body">The control plane rejected this request. Enter the AEGIS_API_KEY to continue. It stays in this tab's session storage.</p>
+      <label class="field"><span>API key</span><input id="key-dialog-input" type="password" autocomplete="off" spellcheck="false"></label>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" class="btn btn-ghost">Cancel</button>
+        <button type="submit" value="save" class="btn">Save and retry</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
