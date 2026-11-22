@@ -115,6 +115,28 @@ def test_a_failing_migration_rolls_back_and_leaves_the_version_unchanged(tmp_pat
     assert "half_done" not in tables
 
 
+def test_a_store_that_fails_to_open_does_not_leak_its_connection(tmp_path, monkeypatch):
+    path = str(tmp_path / "aegis.db")
+    Store(path).close()
+    db = sqlite3.connect(path)
+    db.execute(f"PRAGMA user_version = {len(MIGRATIONS) + 1}")
+    db.close()
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        opened.append(real_connect(*args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(storage.sqlite3, "connect", recording_connect)
+
+    with pytest.raises(RuntimeError):
+        Store(path)
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
 def test_a_database_from_a_newer_build_is_refused(tmp_path):
     path = str(tmp_path / "aegis.db")
     Store(path).close()

@@ -126,8 +126,12 @@ class Store:
             path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000
         )
         self.db.row_factory = sqlite3.Row
-        self._configure()
-        self._migrate()
+        try:
+            self._configure()
+            self._migrate()
+        except BaseException:
+            self.db.close()
+            raise
 
     def _configure(self) -> None:
         """Enable WAL so readers do not block the writer, and wait out brief lock contention.
