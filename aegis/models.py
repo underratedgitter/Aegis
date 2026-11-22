@@ -20,6 +20,24 @@ class IncidentStatus(StrEnum):
     CLOSED = "closed"
 
 
+class ExecutionState(StrEnum):
+    """Lifecycle of one remediation execution record (one per idempotency key)."""
+
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"  # known not to have been applied; safe to try again
+    UNKNOWN = "unknown"  # may have been applied; must be reconciled before another attempt
+
+
+class VerificationState(StrEnum):
+    """Outcome of re-checking the triggering signal after a successful action."""
+
+    VERIFYING = "verifying"
+    VERIFIED = "verified"
+    FAILED = "failed"  # the action succeeded but the signal still fires: escalated
+    UNVERIFIED = "unverified"  # the signal could not be read in the window: escalated
+
+
 class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
