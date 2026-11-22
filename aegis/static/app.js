@@ -942,7 +942,8 @@ async function loadRunbooks({poll}) {
 // ── Audit log ──────────────────────────────────────────────────────────────────
 const KNOWN_AUDIT_ACTIONS = [
   "approve", "batch_approve", "execute", "execute_replayed", "execute_dry_run", "execute_failed",
-  "execute_refused", "remediation_verified", "remediation_escalated", "chaos_inject",
+  "execute_refused", "remediation_verified", "remediation_escalated", "chaos_inject", "investigate",
+  "engine_run_once",
 ];
 
 function syncAuditActions(entries) {
@@ -958,7 +959,7 @@ function syncAuditActions(entries) {
 function auditRowHtml(entry) {
   const {action, at, incident_id: incidentId, approver, ...rest} = entry;
   const target = incidentId ? `<a href="${incidentHref(incidentId)}">${esc(incidentId)}</a>` : esc(rest.service ?? "—");
-  const details = Object.entries(rest).filter(([k]) => k !== "service" || incidentId).map(([k, v]) => `<span class="chip">${esc(k)}=${esc(v)}</span>`).join("");
+  const details = Object.entries(rest).filter(([k]) => k !== "id" && (k !== "service" || incidentId)).map(([k, v]) => `<span class="chip">${esc(k)}=${esc(v)}</span>`).join("");
   return `<tr><td class="nowrap"><time datetime="${esc(at)}">${esc(fmtStamp(at))}</time></td><td><span class="badge">${esc(pretty(action))}</span></td><td>${esc(approver ?? "—")}</td><td>${target}</td><td><span class="kv">${details}</span></td></tr>`;
 }
 
@@ -976,7 +977,9 @@ function renderAudit() {
 }
 
 async function loadAudit() {
-  const audit = await getJson(`/api/audit?limit=${encodeURIComponent($("audit-limit").value)}`, {headers: authHeaders()});
+  const action = $("audit-action").value;
+  const filter = action ? `&action=${encodeURIComponent(action)}` : "";
+  const audit = await getJson(`/api/audit?limit=${encodeURIComponent($("audit-limit").value)}${filter}`, {headers: authHeaders()});
   state.audit = audit;
   syncAuditActions(audit.entries);
   delete state.errors.audit;
@@ -1219,7 +1222,7 @@ for (const id of ["inc-search", "inc-status", "inc-severity"]) {
 for (const id of ["log-search", "log-level"]) $(id).addEventListener(id === "log-search" ? "input" : "change", renderLogs);
 $("log-service").addEventListener("change", () => { state.logs = null; renderLogs(); refresh(); });
 $("log-limit").addEventListener("change", () => refresh());
-$("audit-action").addEventListener("change", renderAudit);
+$("audit-action").addEventListener("change", () => { renderAudit(); refresh(); });
 $("audit-limit").addEventListener("change", () => refresh());
 $("auto-refresh").addEventListener("change", (event) => {
   state.autoRefresh = event.target.checked;

@@ -63,6 +63,21 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
           ON remediation_executions(target) WHERE state = 'in_flight'""",
     ),
+    # 2: the audit log, previously an in-memory buffer lost on restart.
+    (
+        """CREATE TABLE audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          at TEXT NOT NULL,
+          action TEXT NOT NULL,
+          incident_id TEXT,
+          approver TEXT,
+          client_ip TEXT,
+          request_id TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        "CREATE INDEX audit_log_action_idx ON audit_log(action, id)",
+        "CREATE INDEX audit_log_incident_idx ON audit_log(incident_id, id)",
+    ),
 )
 
 
@@ -520,6 +535,69 @@ class Store:
                 item["data"] = json.loads(item.pop("data_json") or "{}")
                 result.append(item)
             return result
+
+    def add_audit(
+        self,
+        action: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        client_ip: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Durably record who did what; `detail` is kept whole, and its incident and approver are indexed."""
+        detail = detail or {}
+        incident_id = detail.get("incident_id")
+        approver = detail.get("approver")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO audit_log(at,action,incident_id,approver,client_ip,request_id,detail_json)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    utc_now(),
+                    action,
+                    None if incident_id is None else str(incident_id),
+                    None if approver is None else str(approver),
+                    client_ip,
+                    request_id,
+                    json.dumps(detail, default=str),
+                ),
+            )
+            self.db.commit()
+
+    def audit_entries(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        action: str | None = None,
+        incident_id: str | None = None,
+        approver: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Audit entries, newest first, with the number that match the filters.
+
+        Each entry is the recorded detail plus `id`, `at`, `action` and, when known,
+        `client_ip` and `request_id`.
+        """
+        filters = {"action": action, "incident_id": incident_id, "approver": approver}
+        active = {column: value for column, value in filters.items() if value is not None}
+        where = " AND ".join(f"{column} = ?" for column in active) or "1"
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) FROM audit_log WHERE {where}", tuple(active.values())
+            ).fetchone()[0]
+            rows = self.db.execute(
+                f"SELECT * FROM audit_log WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*active.values(), limit, offset),
+            ).fetchall()
+        entries = []
+        for row in rows:
+            entry = json.loads(row["detail_json"] or "{}")
+            entry.update(id=row["id"], at=row["at"], action=row["action"])
+            for column in ("client_ip", "request_id"):
+                if row[column] is not None:
+                    entry[column] = row[column]
+            entries.append(entry)
+        return entries, total
 
     def incident_status_counts(self) -> dict[str, int]:
         """Number of incidents in each status."""

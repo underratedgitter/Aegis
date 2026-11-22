@@ -59,26 +59,6 @@ class TestEventDurability:
         assert "detected" in kinds
 
 
-class TestAuditLogIsBounded:
-    @pytest.fixture(autouse=True)
-    def _restore(self):
-        saved = list(control_plane._audit_log)
-        control_plane._audit_log.clear()
-        yield
-        control_plane._audit_log.clear()
-        control_plane._audit_log.extend(saved)
-
-    def test_oldest_entries_are_dropped(self):
-        limit = control_plane.AUDIT_LOG_MAX_ENTRIES
-        for i in range(limit + 250):
-            control_plane._audit("test", {"n": i})
-
-        assert len(control_plane._audit_log) == limit
-        # The most recent entry is retained, the earliest is gone.
-        assert control_plane._audit_log[-1]["n"] == limit + 249
-        assert control_plane._audit_log[0]["n"] == 250
-
-
 class TestRateLimiterIsBounded:
     @pytest.fixture(autouse=True)
     def _restore(self):

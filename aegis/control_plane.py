@@ -8,8 +8,8 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import deque
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from statistics import mean
 from typing import TYPE_CHECKING, Any
@@ -83,13 +83,33 @@ REGISTRY.register(ControlPlaneCollector(store, engine))
 
 # ─── Audit Log ────────────────────────────────────────────────────────────────
 
-AUDIT_LOG_MAX_ENTRIES = 1000
-_audit_log: deque[dict[str, Any]] = deque(maxlen=AUDIT_LOG_MAX_ENTRIES)
+# Who is calling, for audit entries written while a protected request is handled.
+_audit_origin: ContextVar[tuple[str | None, str | None]] = ContextVar(
+    "audit_origin", default=(None, None)
+)
+
+
+async def _bind_audit_origin(request: Request) -> None:
+    """Remember the caller's address and request ID for this request's audit entries.
+
+    Async on purpose: a sync dependency runs in a copied context, so what it set would
+    not reach the endpoint.
+    """
+    client_ip = request.client.host if request.client else None
+    _audit_origin.set((client_ip, getattr(request.state, "request_id", None)))
 
 
 def _audit(action: str, detail: dict[str, Any]) -> None:
-    """Record an audit event. The buffer is bounded; oldest entries are dropped."""
-    _audit_log.append({"action": action, "at": utc_now(), **detail})
+    """Durably record an audit event with the caller's address and request ID when known.
+
+    The action it records has already happened, so a database error is logged loudly
+    rather than turned into a failed response.
+    """
+    client_ip, request_id = _audit_origin.get()
+    try:
+        store.add_audit(action, detail, client_ip=client_ip, request_id=request_id)
+    except sqlite3.Error:
+        logger.exception("audit entry %s could not be written: %s", action, detail)
 
 
 remediation = RemediationExecutor(settings, store, telemetry=telemetry, audit=_audit)
@@ -169,7 +189,7 @@ def verify_api_key(request: Request) -> None:
 
 
 # Applied to every route that changes state or triggers an action.
-PROTECTED = [Depends(verify_api_key)]
+PROTECTED = [Depends(_bind_audit_origin), Depends(verify_api_key)]
 
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -395,6 +415,7 @@ def investigate(incident_id: str) -> InvestigateResponse:
         result = agent.investigate(incident_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit("investigate", {"incident_id": incident_id})
     return InvestigateResponse(
         incident_id=incident_id, investigation=Investigation.model_validate(result)
     )
@@ -439,8 +460,18 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
 # ─── Audit Log ────────────────────────────────────────────────────────────────
 
 @app.get("/api/audit", dependencies=PROTECTED)
-def audit_log(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
-    return {"entries": list(_audit_log)[-limit:][::-1], "total": len(_audit_log)}
+def audit_log(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    action: str | None = Query(None, max_length=64),
+    incident_id: str | None = Query(None, max_length=64),
+    approver: str | None = Query(None, max_length=80),
+) -> dict[str, Any]:
+    """Audit entries, newest first; `total` counts every entry that matches the filters."""
+    entries, total = store.audit_entries(
+        limit=limit, offset=offset, action=action, incident_id=incident_id, approver=approver
+    )
+    return {"entries": entries, "total": total, "limit": limit, "offset": offset}
 
 
 # ─── Chaos & Telemetry ────────────────────────────────────────────────────────
@@ -485,7 +516,9 @@ def runbooks() -> list[Runbook]:
 
 @app.post("/api/engine/run-once", dependencies=PROTECTED)
 def run_engine_once() -> dict[str, Any]:
-    return {"fired": engine.run_once()}
+    fired = engine.run_once()
+    _audit("engine_run_once", {"fired": len(fired)})
+    return {"fired": fired}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
