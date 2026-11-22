@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import httpx
 
 from aegis.auth import bearer_header
-from aegis.models import ExecutionState, RemediationAction
+from aegis.models import ExecutionState, RemediationAction, VerificationState
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
@@ -22,9 +23,12 @@ if TYPE_CHECKING:
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
 
+logger = logging.getLogger(__name__)
+
 # Connecting fails faster than the read/write/pool timeout (AEGIS_REMEDIATION_TIMEOUT_SECONDS).
 ADMIN_CONNECT_TIMEOUT_SECONDS = 2.0
 BACKOFF_CAP_SECONDS = 10.0
+SHUTDOWN_JOIN_SECONDS = 15.0
 MAY_HAVE_APPLIED = "may have been applied"
 
 
@@ -39,7 +43,7 @@ class RemediationError(ValueError):
         self.detail = detail
 
 
-class RemediationRateLimited(RemediationError):
+class RemediationRateLimitError(RemediationError):
     """The target has had its share of executions for the current window."""
 
     status_code = 429
@@ -49,7 +53,7 @@ class RemediationRateLimited(RemediationError):
         self.retry_after = retry_after
 
 
-class RemediationActionFailed(RemediationError):
+class RemediationActionError(RemediationError):
     """The service's admin API did not accept the action: nothing is known to be fixed."""
 
     status_code = 502
@@ -99,6 +103,8 @@ class RemediationExecutor:
             "inventory": settings.inventory_url,
         }
         self._stop = threading.Event()
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
         self._client = httpx.Client(
             timeout=httpx.Timeout(
                 float(settings.remediation_timeout_seconds), connect=ADMIN_CONNECT_TIMEOUT_SECONDS
@@ -133,12 +139,12 @@ class RemediationExecutor:
 
         Raises:
             RemediationError: If validation, a guardrail, or execution fails.
-                RemediationActionFailed means the action itself did not go through.
+                RemediationActionError means the action itself did not go through.
         """
         try:
             result = self._execute(incident_id, approver)
         except RemediationError as exc:
-            kind = "execute_failed" if isinstance(exc, RemediationActionFailed) else "execute_refused"
+            kind = "execute_failed" if isinstance(exc, RemediationActionError) else "execute_refused"
             self._record(kind, incident_id=incident_id, approver=approver, reason=str(exc), **exc.detail)
             raise
         kind = {"executed": "execute", "already_executed": "execute_replayed", "dry_run": "execute_dry_run"}[
@@ -231,6 +237,7 @@ class RemediationExecutor:
             "result": remediation.get("result", {}),
             "idempotency_key": key,
             "attempts": remediation.get("attempts"),
+            "verification": (remediation.get("verification") or {}).get("state"),
         }
 
     def _run(
@@ -282,7 +289,7 @@ class RemediationExecutor:
             )
         if outcome == "rate_limited":
             retry_after = self._retry_after(row["started_at"])
-            raise RemediationRateLimited(
+            raise RemediationRateLimitError(
                 f"Remediation limit reached: {self.settings.remediation_max_per_window} "
                 f"executions on {target} per {self.settings.remediation_window_seconds}s; "
                 f"retry in {retry_after}s",
@@ -358,7 +365,7 @@ class RemediationExecutor:
             f"Remediation {action} on {target} failed {summary}",
             {**detail, "approver": approver, "errors": sent.errors},
         )
-        raise RemediationActionFailed(f"Remediation request failed {summary}", **detail)
+        raise RemediationActionError(f"Remediation request failed {summary}", **detail)
 
     def _succeed(
         self, incident_id: str, key: str, action: str, target: str, approver: str, sent: _Send
@@ -378,13 +385,22 @@ class RemediationExecutor:
             "idempotency_key": key,
             "attempts": sent.attempts,
         }
+        verifying = self._verification_enabled()
+        if verifying:
+            remediation["verification"] = {
+                "state": VerificationState.VERIFYING.value,
+                "started_at": utc_now(),
+                "window_seconds": self.settings.remediation_verify_seconds,
+            }
         self._complete(incident_id, key, remediation)
         self.store.add_event(
             incident_id,
             "remediation_executed",
             f"Approved remediation executed by {approver}: {action} on {target}",
-            {**remediation, "result": result},
+            remediation,
         )
+        if verifying:
+            self._spawn_verification(incident_id)
         return {
             "status": "executed",
             "incident_id": incident_id,
@@ -393,6 +409,7 @@ class RemediationExecutor:
             "result": result,
             "idempotency_key": key,
             "attempts": sent.attempts,
+            "verification": VerificationState.VERIFYING.value if verifying else None,
         }
 
     def _complete(self, incident_id: str, key: str, remediation: dict[str, Any]) -> None:
@@ -441,6 +458,131 @@ class RemediationExecutor:
             "idempotency_key": key,
             "attempts": previous["attempts"],
         }
+
+    def _verification_enabled(self) -> bool:
+        return self.telemetry is not None and self.settings.remediation_verify_seconds > 0
+
+    def _spawn_verification(self, incident_id: str) -> None:
+        """Verify in a background thread that `close()` can wait for."""
+
+        def work() -> None:
+            try:
+                self.verify(incident_id)
+            except Exception:
+                # Left "verifying" on purpose: it is picked up again at the next start.
+                logger.exception("Verification of %s failed", incident_id)
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
+
+        worker = threading.Thread(target=work, name=f"verify-{incident_id}", daemon=True)
+        with self._workers_lock:
+            self._workers.add(worker)
+        worker.start()
+
+    def resume_verifications(self) -> None:
+        """Verify again the remediations that a restart interrupted. Call once at startup."""
+        if not self._verification_enabled():
+            return
+        for incident in self.store.list_incidents(limit=1000):
+            remediation = incident["data"].get("remediation")
+            verification = remediation.get("verification") if isinstance(remediation, dict) else None
+            if isinstance(verification, dict) and verification.get("state") == VerificationState.VERIFYING:
+                self._spawn_verification(incident["id"])
+
+    def verify(self, incident_id: str) -> str:
+        """Re-check the signals behind an incident after its remediation succeeded.
+
+        Polls every AEGIS_REMEDIATION_VERIFY_INTERVAL seconds for up to
+        AEGIS_REMEDIATION_VERIFY_SECONDS. The remediation is "verified" once every signal
+        has been below its threshold for AEGIS_RESOLUTION_CYCLES consecutive checks. If
+        the window ends first, the action worked but the problem persists ("failed") or
+        could not be checked ("unverified"), and the incident is escalated.
+
+        Returns:
+            The outcome, or "verifying" when shutdown interrupted it.
+        """
+        incident = self.store.get_incident(incident_id)
+        remediation = (incident or {}).get("data", {}).get("remediation")
+        if not isinstance(remediation, dict):
+            raise RemediationError("Incident has no remediation to verify")
+        key = remediation.get("idempotency_key")
+        needed = self.settings.resolution_cycles
+        interval = self.settings.remediation_verify_interval
+        polls = max(needed, self.settings.remediation_verify_seconds // interval + 1)
+        streak = 0
+        verdict: bool | None = None
+        readings: list[dict[str, Any]] = []
+        for poll in range(polls):
+            current = self.store.get_incident(incident_id)
+            if current is None:
+                raise RemediationError("Incident not found")
+            readings = self._signal_readings(current)
+            verdict = self._signals_clear(readings)
+            streak = streak + 1 if verdict else 0
+            if streak >= needed:
+                return self._conclude(current, key, VerificationState.VERIFIED, readings)
+            if poll < polls - 1 and self._stop.wait(interval):
+                return VerificationState.VERIFYING.value
+        state = VerificationState.FAILED if verdict is False else VerificationState.UNVERIFIED
+        latest = self.store.get_incident(incident_id)
+        if latest is None:
+            raise RemediationError("Incident not found")
+        return self._conclude(latest, key, state, readings)
+
+    def _conclude(
+        self,
+        incident: dict[str, Any],
+        key: str | None,
+        state: VerificationState,
+        readings: list[dict[str, Any]],
+    ) -> str:
+        """Record a verification outcome, and escalate when the problem is not fixed."""
+        incident_id = incident["id"]
+        remediation = incident["data"].get("remediation") or {}
+        if remediation.get("idempotency_key") != key:
+            return state.value  # a newer execution owns the record now
+        rules = [reading["rule"] for reading in readings]
+        verification = {
+            **remediation.get("verification", {}),
+            "state": state.value,
+            "finished_at": utc_now(),
+            "readings": readings,
+        }
+        detail = {"incident_id": incident_id, "idempotency_key": key, "rules": rules}
+        if state is VerificationState.VERIFIED:
+            self.store.merge_incident(incident_id, {"remediation": {**remediation, "verification": verification}})
+            self.store.add_event(
+                incident_id,
+                "remediation_verified",
+                f"Remediation verified: {', '.join(rules)} back under threshold",
+                {**detail, "readings": readings},
+            )
+            self._record("remediation_verified", **detail)
+            return state.value
+
+        verification["escalated"] = True
+        previous_severity = incident["severity"]
+        if incident["status"] not in {"resolved", "closed"}:
+            self.store.update_incident(incident_id, severity="critical")
+        self.store.merge_incident(incident_id, {"remediation": {**remediation, "verification": verification}})
+        window = self.settings.remediation_verify_seconds
+        problem = (
+            f"the signal is still firing ({', '.join(rules)})"
+            if state is VerificationState.FAILED
+            else "Aegis could not read the signal"
+        )
+        self.store.add_event(
+            incident_id,
+            "remediation_escalated",
+            f"Remediation action succeeded but it is not confirmed fixed: {problem} after "
+            f"{window}s of checks. Escalated for an operator to take over.",
+            {**detail, "state": state.value, "previous_severity": previous_severity, "readings": readings},
+        )
+        self._record(
+            "remediation_escalated", **detail, state=state.value, previous_severity=previous_severity
+        )
+        return state.value
 
     def _previous_attempt_applied(self, incident: dict[str, Any]) -> bool | None:
         """Whether an attempt of unknown outcome took effect: True, False, or None if unknowable."""
@@ -495,7 +637,7 @@ class RemediationExecutor:
     def _retryable(exc: Exception) -> bool:
         """A 4xx or malformed URL will fail again; anything else may be transient."""
         if isinstance(exc, httpx.HTTPStatusError):
-            return exc.response.status_code >= 500
+            return bool(exc.response.status_code >= 500)
         return not isinstance(exc, httpx.InvalidURL)
 
     @staticmethod
@@ -581,6 +723,10 @@ class RemediationExecutor:
         return action, target
 
     def close(self) -> None:
-        """Stop retrying and close the HTTP client."""
+        """Stop retrying and verifying, wait for verification threads, and close the HTTP client."""
         self._stop.set()
+        with self._workers_lock:
+            workers = [*self._workers]
+        for worker in workers:
+            worker.join(timeout=SHUTDOWN_JOIN_SECONDS)
         self._client.close()

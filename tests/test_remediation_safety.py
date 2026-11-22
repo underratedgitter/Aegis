@@ -5,12 +5,11 @@ import threading
 import httpx
 import pytest
 
-from aegis.queries import CHECKOUT_CPU_BURN
 from aegis.remediation import (
-    RemediationActionFailed,
+    RemediationActionError,
     RemediationError,
     RemediationExecutor,
-    RemediationRateLimited,
+    RemediationRateLimitError,
 )
 from aegis.settings import Settings
 from aegis.storage import Store
@@ -241,7 +240,7 @@ def test_a_rejection_is_not_retried(tmp_path, monkeypatch):
 
     calls = posts(executor, monkeypatch, responder)
 
-    with pytest.raises(RemediationActionFailed, match="rejected, not applied"):
+    with pytest.raises(RemediationActionError, match="rejected, not applied"):
         executor.execute("inc-1", "op")
 
     assert len(calls) == 1
@@ -258,7 +257,7 @@ def test_exhausted_retries_report_the_action_as_failed_with_every_attempt(tmp_pa
 
     calls = posts(executor, monkeypatch, responder)
 
-    with pytest.raises(RemediationActionFailed) as caught:
+    with pytest.raises(RemediationActionError) as caught:
         executor.execute("inc-1", "op")
 
     assert len(calls) == 3
@@ -279,7 +278,7 @@ def test_a_timeout_that_may_have_applied_leaves_the_execution_unknown(tmp_path, 
 
     posts(executor, monkeypatch, responder)
 
-    with pytest.raises(RemediationActionFailed, match="may have been applied"):
+    with pytest.raises(RemediationActionError, match="may have been applied"):
         executor.execute("inc-1", "op")
 
     assert store.executions("inc-1")[0]["state"] == "unknown"
@@ -360,7 +359,7 @@ def test_executions_beyond_the_per_target_limit_are_refused_with_a_retry_hint(tm
     calls = posts(executor, monkeypatch)
     executor.execute("inc-1", "op")
 
-    with pytest.raises(RemediationRateLimited) as caught:
+    with pytest.raises(RemediationRateLimitError) as caught:
         executor.execute("inc-2", "op")
 
     assert len(calls) == 1
@@ -465,7 +464,7 @@ def test_a_failed_action_is_audited_with_its_attempts_and_outcome(tmp_path, monk
 
     posts(executor, monkeypatch, responder)
 
-    with pytest.raises(RemediationActionFailed):
+    with pytest.raises(RemediationActionError):
         executor.execute("inc-1", "op")
 
     action, detail = entries[0]
