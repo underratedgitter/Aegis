@@ -34,6 +34,8 @@ logger = configure_logging(SERVICE, LOG_PATH)
 _settings = Settings()
 _auth_failures = AuthFailureLimiter(_settings.auth_fail_max, _settings.auth_fail_window)
 
+UNMATCHED_ROUTE = "unmatched"
+
 HTTP_REQUESTS = Counter(
     "aegis_http_requests_total", "HTTP requests handled", ["service", "method", "route", "status"]
 )
@@ -260,7 +262,6 @@ async def observe(
 ) -> Response:
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     started = time.perf_counter()
-    route = request.url.path
     status = 500
     try:
         response = await call_next(request)
@@ -269,6 +270,10 @@ async def observe(
         return response
     finally:
         elapsed = time.perf_counter() - started
+        # The route template, not the raw path: any client can invent paths, and every
+        # distinct label value would live in the process and in Prometheus for good.
+        matched = request.scope.get("route")
+        route = getattr(matched, "path", None) or UNMATCHED_ROUTE
         HTTP_REQUESTS.labels(SERVICE, request.method, route, str(status)).inc()
         HTTP_LATENCY.labels(SERVICE, request.method, route).observe(elapsed)
         logger.info(
