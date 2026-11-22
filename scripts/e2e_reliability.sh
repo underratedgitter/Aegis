@@ -13,7 +13,8 @@
 #          E2E_SCENARIOS      space separated subset of "1 2 3 4 5 6 7" (default all)
 #          E2E_KEEP=1         leave the project running afterwards (default: down -v)
 #          E2E_SKIP_UP=1      use an already running project instead of building one
-#          E2E_POLL_SECONDS, E2E_DETECTION_CYCLES, E2E_BLIND_SECONDS, E2E_VERIFY_SECONDS tune speed
+#          E2E_POLL_SECONDS, E2E_DETECTION_CYCLES, E2E_RESOLUTION_CYCLES, E2E_BLIND_SECONDS,
+#          E2E_VERIFY_SECONDS tune speed
 # Needs:   docker compose v2.24+, curl, jq. Exits non-zero when any check fails.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -25,6 +26,8 @@ POLL="${E2E_POLL_SECONDS:-2}"
 K="${E2E_DETECTION_CYCLES:-3}"
 BLIND="${E2E_BLIND_SECONDS:-15}"
 VERIFY="${E2E_VERIFY_SECONDS:-300}"
+# Long enough that an incident whose signals just cleared has not yet resolved when Prometheus is stopped.
+RESOLVE="${E2E_RESOLUTION_CYCLES:-8}"
 
 if [[ "$PROJECT" == "aegis" || "$PROJECT" == societyos* ]]; then
   echo "refusing to run against project '$PROJECT': use a dedicated project name" >&2
@@ -53,15 +56,22 @@ BASELINE="$WORK/baseline.json"
 echo '[]' >"$BASELINE"
 
 # An explicit empty env file keeps Compose from reading a developer's .env.
+# The shipped CPU quotas (0.25 for the demo services) throttle them enough on a busy Docker
+# host that healthy checkout p95 latency crosses its 0.75 s threshold, which would drown the
+# faults injected here in false incidents, so the test project gets one full CPU each.
 cat >"$OVERRIDE" <<EOF
 services:
   control:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
     ports: !override
       - "127.0.0.1:$CONTROL_PORT:8000"
     environment:
       AEGIS_POLL_SECONDS: "$POLL"
       AEGIS_DETECTION_CYCLES: "$K"
-      AEGIS_RESOLUTION_CYCLES: "2"
+      AEGIS_RESOLUTION_CYCLES: "$RESOLVE"
       AEGIS_BLIND_SECONDS: "$BLIND"
       AEGIS_REOPEN_COOLDOWN_SECONDS: "0"
       AEGIS_SIGNAL_EVENT_INTERVAL: "5"
@@ -69,12 +79,24 @@ services:
       AEGIS_REMEDIATION_VERIFY_INTERVAL: "3"
       AEGIS_RATE_LIMIT_MAX: "100000"
   checkout:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
     ports: !override
       - "127.0.0.1:$CHECKOUT_PORT:8000"
   inventory:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
     ports: !override
       - "127.0.0.1:$INVENTORY_PORT:8000"
   prometheus:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
     ports: !override
       - "127.0.0.1:$PROM_PORT:9090"
   loki:
@@ -142,6 +164,7 @@ breaker_not_closed() { [[ "$(breaker_state "$1")" != closed ]]; }
 breaker_closed() { [[ "$(breaker_state "$1")" == closed ]]; }
 cycles() { get /api/engine/status | jq -r .cycles_total; }
 control_ready() { [[ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$CONTROL/healthz")" == 200 ]]; }
+all_signals_ok() { [[ "$(get /api/engine/status | jq '[.signals[] | select(. != "ok")] | length')" == 0 ]]; }
 any_signal_unavailable() { [[ "$(get /api/engine/status | jq '[.signals[] | select(. == "unavailable")] | length')" -gt 0 ]]; }
 
 snapshot() { get "/api/incidents?limit=200" | jq '[.incidents[].id]' >"$BASELINE"; }
@@ -163,11 +186,12 @@ event_count() { incf "$1" "[.events[] | select(.kind == \"$2\")] | length"; }
 cleared_count() { dc logs --no-log-prefix checkout inventory 2>&1 | grep -c faults_cleared || true; }
 sql() { dc exec -T control python -c "import sqlite3,sys;c=sqlite3.connect('/data/aegis.db');print(c.execute(sys.argv[1]).fetchone()[0])" "$1" 2>/dev/null; }
 
-traffic() { while true; do curl -s -m 5 -o /dev/null "$CHECKOUT/api/checkout"; sleep 0.1; done; }
+# Gentle on purpose: the services run with small CPU quotas and heavy load alone would raise latency signals.
+traffic() { while true; do curl -s -m 5 -o /dev/null "$CHECKOUT/api/checkout"; sleep 0.4; done; }
 POLLERS=()
 start_traffic() {
   local _
-  for _ in 1 2 3; do
+  for _ in 1 2; do
     traffic &
     POLLERS+=($!)
   done
@@ -185,7 +209,7 @@ stop_background() {
 quiesce() {
   dc start prometheus loki checkout inventory >/dev/null 2>&1
   dc unpause checkout inventory >/dev/null 2>&1
-  control_ready || dc up -d control >/dev/null 2>&1
+  control_ready || dc start control >/dev/null 2>&1
   wait_for 120 control_ready
   clear_faults
   wait_for 120 engine_is ok || log "engine not ok before scenario: $(get /api/engine/status | jq -c '{state,reason}')"
@@ -193,6 +217,17 @@ quiesce() {
     log "incidents still active before scenario: $(get '/api/incidents?limit=200' | jq -c '[.incidents[] | select(.status != "resolved") | {id,root_cause_key,status}]')"
   fi
   snapshot
+}
+
+# Approve and execute an incident's recommendation through the API; an incident left waiting for
+# an operator is never auto-resolved, so this is how a scenario finishes its incident. Sets REM_CODE.
+remediate() {
+  api POST "/api/incidents/$1/approve" '{"approver":"e2e-operator"}'
+  REM_CODE="$API_CODE"
+  [[ "$API_CODE" == 200 ]] || return 1
+  api POST "/api/incidents/$1/execute" '{"approver":"e2e-operator"}'
+  REM_CODE="$REM_CODE/$API_CODE"
+  [[ "$API_CODE" == 200 ]]
 }
 
 # --- scenarios ---------------------------------------------------------------------------
@@ -228,7 +263,7 @@ s1_latency() {
   wait "${pids[@]}" 2>/dev/null
   api POST "/api/incidents/$inc/execute" '{"approver":"e2e-operator"}'
   f3="$(echo "$API_BODY" | jq -r .status 2>/dev/null)"
-  statuses="$(for f in "$f1" "$f2"; do head -n -1 "$f" | jq -r '.status // .detail' 2>/dev/null; done | tr '\n' ',')"
+  statuses="$(for f in "$f1" "$f2"; do sed '$d' "$f" | jq -r '.status // .detail' 2>/dev/null; done | tr '\n' ',')"
   check "1.concurrent double execute: exactly one runs, a later one replays" "responses: ${statuses}third=$f3/$API_CODE" \
     "$([[ $(echo "$statuses" | tr ',' '\n' | grep -c '^executed$') == 1 && $f3 == already_executed ]] && echo 0 || echo 1)"
   sleep 2
@@ -251,10 +286,14 @@ s2_dependency() {
   check "2.dependency:inventory incident exists" "count=$(count_new dependency:inventory)" "$([[ $(count_new dependency:inventory) == 1 ]] && echo 0 || echo 1)"
   check "2.no split service:checkout incident" "checkout incidents=$(count_new service:checkout), total=$(count_new)" \
     "$([[ $(count_new service:checkout) == 0 && $(count_new) == 1 ]] && echo 0 || echo 1)"
-  clear_faults
   inc="$(first_new dependency:inventory)"
+  wait_for 90 has_recommendation "$inc"
+  check "2.recommendation clears the inventory dependency fault" "$(incf "$inc" '.data.recommendation | "\(.action) \(.target) \(.parameters.fault)"')" \
+    "$([[ "$(incf "$inc" '.data.recommendation | "\(.action) \(.target) \(.parameters.fault)"')" == "clear_fault inventory dependency" ]] && echo 0 || echo 1)"
+  remediate "$inc"
+  check "2.approve and execute" "HTTP $REM_CODE" "$([[ $REM_CODE == 200/200 ]] && echo 0 || echo 1)"
   wait_for 300 status_is "$inc" resolved
-  check "2.resolves after the fault clears, still a single incident" "status=$(incf "$inc" .status), total=$(count_new)" \
+  check "2.resolves after the fix, still a single incident" "status=$(incf "$inc" .status), total=$(count_new)" \
     "$([[ $(incf "$inc" .status) == resolved && $(count_new) == 1 ]] && echo 0 || echo 1)"
 }
 
@@ -265,21 +304,26 @@ s3_prometheus() {
   chaos checkout errors 1
   wait_for 120 has_new service:checkout
   inc="$(first_new service:checkout)"
-  log "incident $inc open; stopping prometheus"
+  wait_for 90 has_recommendation "$inc"
+  remediate "$inc"
+  check "3.fix executed (incident goes back to open and starts counting healthy cycles)" "HTTP $REM_CODE status=$(incf "$inc" .status)" "$([[ $REM_CODE == 200/200 ]] && echo 0 || echo 1)"
+  # Rates are averaged over 2 minutes, so the signal needs a while to clear. Stop prometheus as
+  # soon as it has: the incident is then moments from resolving on the strength of fresh readings.
+  wait_for 300 all_signals_ok
+  log "signals clear; incident $inc is $(incf "$inc" .status); stopping prometheus"
   dc stop prometheus >/dev/null 2>&1
-  clear_faults # the fault is gone, but Aegis cannot see that
   wait_for 60 engine_is degraded
   check "3.engine reports degraded" "$(get /api/engine/status | jq -c '{state,reason}')" "$(ok engine_is degraded)"
   wait_for 30 breaker_not_closed prometheus
   check "3.prometheus breaker not closed" "breaker=$(breaker_state prometheus)" "$(ok breaker_not_closed prometheus)"
   check "3.signals reported unavailable" "$(get /api/engine/status | jq -c '.signals')" "$(ok any_signal_unavailable)"
-  sleep $((POLL * 6))
-  check "3.incident not auto-resolved while blind" "status=$(incf "$inc" .status)" "$(ok status_not "$inc" resolved)"
+  sleep $((POLL * RESOLVE + 10)) # long enough to have resolved had the outage looked healthy
+  check "3.incident not auto-resolved while blind" "status=$(incf "$inc" .status) after $((POLL * RESOLVE + 10))s without telemetry" "$(ok status_not "$inc" resolved)"
   wait_for $((BLIND + 40)) has_new telemetry:blind
   blind="$(first_new telemetry:blind)"
   check "3.telemetry:blind incident after AEGIS_BLIND_SECONDS=$BLIND" "incident=${blind:-none} rules=$(incf "${blind:-x}" '.data.latest_evidence.blind_rules | join(",")')" "$([[ -n $blind ]] && echo 0 || echo 1)"
   check "3.blind incident offers no remediation" "status=$(incf "${blind:-x}" .status), recommendation=$(incf "${blind:-x}" '.data.recommendation // "none"')" \
-    "$([[ -n $blind && $(incf "$blind" '.data.recommendation // "none"') == none ]] && echo 0 || echo 1)"
+    "$([[ -n $blind && $(incf "$blind" '.data.recommendation // "none"') == none && $(incf "$blind" .status) == open ]] && echo 0 || echo 1)"
   if [[ -n "$blind" ]]; then
     api POST "/api/incidents/$blind/approve" '{"approver":"e2e-operator"}'
     check "3.blind incident cannot be approved" "HTTP $API_CODE" "$([[ $API_CODE == 409 ]] && echo 0 || echo 1)"
@@ -293,6 +337,8 @@ s3_prometheus() {
   check "3.engine ok again after prometheus returns" "$(get /api/engine/status | jq -c '{state,reason}')" "$(ok engine_is ok)"
   wait_for 60 breaker_closed prometheus
   check "3.breaker closed again" "breaker=$(breaker_state prometheus)" "$(ok breaker_closed prometheus)"
+  wait_for $((VERIFY + 60)) verification_is "$inc" verified
+  check "3.verification resumed once telemetry returned" "state=$(verification_state "$inc")" "$(ok verification_is "$inc" verified)"
   wait_for 300 status_is "$inc" resolved
   check "3.original incident resolves after recovery" "status=$(incf "$inc" .status)" "$(ok status_is "$inc" resolved)"
   if [[ -n "$blind" ]]; then wait_for 120 status_is "$blind" resolved; fi
@@ -316,9 +362,10 @@ s4_loki() {
   ready="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$CONTROL/readyz")"
   check "4./readyz 200 with loki down" "HTTP $ready" "$([[ $ready == 200 ]] && echo 0 || echo 1)"
   dc start loki >/dev/null 2>&1
-  clear_faults
+  remediate "$inc"
+  check "4.approve and execute" "HTTP $REM_CODE" "$([[ $REM_CODE == 200/200 ]] && echo 0 || echo 1)"
   wait_for 300 status_is "$inc" resolved
-  check "4.incident resolves once the fault clears" "status=$(incf "$inc" .status)" "$(ok status_is "$inc" resolved)"
+  check "4.incident resolves after the fix" "status=$(incf "$inc" .status)" "$(ok status_is "$inc" resolved)"
 }
 
 s5_restart() {
@@ -401,7 +448,7 @@ s7_kill() {
   log "killing control with SIGKILL under load"
   dc kill -s SIGKILL control >/dev/null 2>&1
   sleep 3
-  dc up -d control >/dev/null 2>&1
+  dc start control >/dev/null 2>&1
   wait_for 120 control_ready
   stop_background
   start_traffic
@@ -414,7 +461,8 @@ s7_kill() {
   check "7.nothing stuck executing" "executing=$n" "$([[ $n == 0 ]] && echo 0 || echo 1)"
   sleep $((POLL * 6))
   check "7.still a single checkout incident (recovered engine did not duplicate it)" "count=$(count_new service:checkout)" "$([[ $(count_new service:checkout) == 1 ]] && echo 0 || echo 1)"
-  clear_faults
+  remediate "$inc"
+  check "7.the recommendation made before the crash can still be approved and executed" "HTTP $REM_CODE" "$([[ $REM_CODE == 200/200 ]] && echo 0 || echo 1)"
   wait_for 300 status_is "$inc" resolved
   check "7.incident resolves after the restart" "status=$(incf "$inc" .status)" "$(ok status_is "$inc" resolved)"
 }

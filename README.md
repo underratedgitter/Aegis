@@ -320,6 +320,10 @@ The engine loop cannot silently die or stall. Each evaluation cycle runs under a
 
 The heartbeat is the time of the last successful cycle. The engine is `degraded` while cycles are failing, and `stalled` (readiness 503) when there has been no success for `AEGIS_ENGINE_STALE_INTERVALS` poll intervals plus one cycle timeout (default 3 x 5 s + 60 s = 75 s). The top-bar engine pill and the Settings view show the state, the reason, the last error and the breakers.
 
+### Fault-injection proof
+
+`make e2e-reliability` (`scripts/e2e_reliability.sh`) builds a separate Compose project (default `aegis-rel`, host ports `E2E_PORT_BASE` to +5, default 8140-8145, never the default project) and injects real faults: a latency fault walked through investigation, approval, a double execute, verification and auto-resolve; a dependency fault; Prometheus down mid-incident; Loki down; control restarted mid-execution and mid-verification; checkout stopped; control killed with SIGKILL under load. It exits non-zero if any check fails and removes the project afterwards (`E2E_KEEP=1` keeps it). It needs Docker Compose v2.24+, `curl` and `jq`, and takes about 25 minutes.
+
 ### Database and backups
 
 Incident history lives in SQLite at `AEGIS_DB_PATH` (Compose: the `aegis-data` volume at `/data`). It runs in WAL mode with `synchronous=NORMAL` and a 10 s busy timeout, so reads do not block the engine and brief lock contention is retried instead of failing.
