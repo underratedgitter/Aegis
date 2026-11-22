@@ -8,7 +8,8 @@ import yaml
 
 from aegis.settings import Settings
 
-COMPOSE = yaml.safe_load((Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text())
+ROOT = Path(__file__).resolve().parent.parent
+COMPOSE = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
 
 # Variable -> (Settings attribute, services that read it)
 PASSTHROUGH = {
@@ -66,6 +67,19 @@ def test_prometheus_does_not_expose_unauthenticated_lifecycle_endpoints():
 
     assert not any("enable-lifecycle" in str(argument) for argument in command)
     assert not any("enable-admin-api" in str(argument) for argument in command)
+
+
+def test_promtail_keeps_its_read_positions_on_a_volume():
+    # In /tmp the positions vanish with the container, so every recreate re-ships all logs to Loki.
+    config = yaml.safe_load((ROOT / "observability/promtail.yml").read_text())
+    positions = Path(config["positions"]["filename"])
+    writable_volumes = []
+    for mount in COMPOSE["services"]["promtail"]["volumes"]:
+        source, target, *mode = mount.split(":")
+        if not source.startswith((".", "/")) and "ro" not in mode:
+            writable_volumes.append((source, Path(target)))
+
+    assert any(target in positions.parents and source in COMPOSE["volumes"] for source, target in writable_volumes)
 
 
 def test_dry_run_is_passed_with_the_settings_default(monkeypatch):

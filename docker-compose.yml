@@ -196,6 +196,7 @@ services:
     volumes:
       - ./observability/promtail.yml:/etc/promtail/config.yml:ro
       - aegis-logs:/var/log/aegis:ro
+      - promtail-data:/promtail
     depends_on:
       loki:
         condition: service_healthy
@@ -242,4 +243,5 @@ volumes:
   aegis-data:
   aegis-logs:
   prometheus-data:
+  promtail-data:
   grafana-data:
