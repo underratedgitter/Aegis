@@ -10,6 +10,13 @@ const TOAST_LIMIT = 4;
 const DEFAULT_APPROVER = "demo-operator";
 const APPROVER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._@+-]{1,79}$/;
 const FINAL_STATUSES = new Set(["resolved", "closed"]);
+// Outcome of re-checking the signal after a fix ran (incident.data.remediation.verification.state).
+const VERIFY_LABELS = {
+  verifying: "Verifying recovery",
+  verified: "Fix verified",
+  failed: "Fix not working, escalated",
+  unverified: "Fix unverified, escalated",
+};
 const STATUS_ORDER = {open: 0, investigating: 1, recommendation_pending: 2, approved: 3, executing: 3};
 
 const ROUTES = {
@@ -404,9 +411,14 @@ function sloHtml(slo) {
     <div class="bar" role="img" aria-label="Error budget remaining"><i class="bar-fill${tone}" data-pct="${budget == null ? 0 : (budget * 100).toFixed(1)}"></i></div></div>`;
 }
 
+function verificationBadge(incident) {
+  const state = incident.data?.remediation?.verification?.state;
+  return VERIFY_LABELS[state] ? `<span class="badge verify-${esc(state)}">${esc(VERIFY_LABELS[state])}</span>` : "";
+}
+
 function incidentRowHtml(incident) {
   return `<a class="incident-row" href="${incidentHref(incident.id)}">
-    <span class="row-badges"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span></span>
+    <span class="row-badges"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span>${verificationBadge(incident)}</span>
     <span class="incident-title">${esc(incident.title)}</span><time datetime="${esc(incident.last_seen)}">${esc(fmtStamp(incident.last_seen))}</time></a>`;
 }
 
@@ -476,7 +488,7 @@ function filterIncidents(incidents) {
 function incidentItemHtml(incident) {
   const current = state.route.id === incident.id ? ` aria-current="true"` : "";
   return `<li><a class="incident-item" href="${incidentHref(incident.id)}"${current}>
-    <span class="row"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span></span>
+    <span class="row"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span>${verificationBadge(incident)}</span>
     <span class="incident-title">${esc(incident.title)}</span>
     <span class="incident-meta"><span>${esc(incident.id)} · ${esc(incident.root_cause_key)}</span><span>${esc(fmtStamp(incident.last_seen))}</span></span></a></li>`;
 }
@@ -514,6 +526,16 @@ function paramChips(parameters) {
   return Object.entries(parameters ?? {}).map(([k, v]) => `<span class="chip">${esc(k)}=${esc(typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
 }
 
+function verificationLine(verification) {
+  switch (verification.state) {
+    case "verifying": return `Verifying recovery: re-checking the signal for up to ${esc(verification.window_seconds)}s.`;
+    case "verified": return "Verified: the signal is back under its threshold.";
+    case "failed": return "The action succeeded but the signal is still firing. Escalated to critical for an operator to take over.";
+    case "unverified": return "The action succeeded but Aegis could not read the signal to confirm. Escalated to critical for an operator to check.";
+    default: return "";
+  }
+}
+
 function recommendationHtml(incident) {
   const rec = incident.data?.recommendation;
   if (!rec) return "";
@@ -523,7 +545,10 @@ function recommendationHtml(incident) {
   const lines = [];
   if (approval) lines.push(`Approved by <strong>${esc(approval.approver)}</strong> at ${esc(fmtStamp(approval.approved_at))}.`);
   if (remediation) {
-    lines.push(`Executed by <strong>${esc(remediation.approver)}</strong> at ${esc(fmtStamp(remediation.at))}.`);
+    const attempts = remediation.attempts ?? 1;
+    lines.push(`Executed by <strong>${esc(remediation.approver)}</strong> at ${esc(fmtStamp(remediation.at))} after ${esc(attempts)} attempt${attempts === 1 ? "" : "s"}.`);
+    if (remediation.verification) lines.push(verificationLine(remediation.verification));
+    if (remediation.idempotency_key) lines.push(`<small>Execution key ${esc(remediation.idempotency_key)}</small>`);
     lines.push(`<pre class="result-pre">${esc(JSON.stringify(remediation.result ?? {}, null, 2).slice(0, 800))}</pre>`);
   }
   return `<section class="rec-card${done ? " is-done" : ""}" aria-label="Recommended remediation">
@@ -589,7 +614,7 @@ function detailHtml(incident) {
   return `<div class="detail">
     <a class="back-link" href="#/incidents">${iconSvg("back")}All incidents</a>
     <div class="detail-head">
-      <div class="row"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span><span class="root">${esc(incident.root_cause_key)}</span></div>
+      <div class="row"><span class="badge severity-${esc(incident.severity)}">${esc(incident.severity)}</span><span class="badge status-${esc(incident.status)}">${esc(pretty(incident.status))}</span>${verificationBadge(incident)}<span class="root">${esc(incident.root_cause_key)}</span></div>
       <h2>${esc(incident.title)}</h2>
       <dl class="facts">
         <div><dt>Incident</dt><dd>${esc(incident.id)}</dd></div>
@@ -685,7 +710,9 @@ async function executeIncident(id) {
   if (!confirmed) return;
   await perform(`execute:${id}`, async () => {
     const result = await post(`/api/incidents/${encodeURIComponent(id)}/execute`, {approver});
-    toast(`Executed ${result.action} on ${result.target}. Aegis will verify recovery.`);
+    if (result.status === "dry_run") toast(`Dry run: ${result.action} on ${result.target} was validated and not sent. Nothing changed.`, "warn");
+    else if (result.status === "already_executed") toast(`${result.action} on ${result.target} already ran for this approval; it was not repeated.`);
+    else toast(`Executed ${result.action} on ${result.target}. Aegis will verify recovery.`);
   });
 }
 
@@ -910,7 +937,10 @@ async function loadRunbooks({poll}) {
 }
 
 // ── Audit log ──────────────────────────────────────────────────────────────────
-const KNOWN_AUDIT_ACTIONS = ["approve", "batch_approve", "execute", "chaos_inject"];
+const KNOWN_AUDIT_ACTIONS = [
+  "approve", "batch_approve", "execute", "execute_replayed", "execute_dry_run", "execute_failed",
+  "execute_refused", "remediation_verified", "remediation_escalated", "chaos_inject",
+];
 
 function syncAuditActions(entries) {
   const select = $("audit-action");

@@ -97,3 +97,38 @@ class TestEngineHealthDisplay:
     def test_a_failed_engine_read_never_marks_the_control_plane_disconnected(self):
         body = APP_JS.split("async function loadEngineStatus()")[1].split("\n}\n")[0]
         assert "setConnection" not in body
+class TestRemediationOutcomes:
+    """The control room must show whether a fix was verified, not just that it ran."""
+
+    def test_verification_states_have_a_label_and_a_style(self):
+        for state in ("verifying", "verified", "failed", "unverified"):
+            assert f"{state}:" in APP_JS, state
+            assert f".verify-{state}" in CSS, state
+        assert "function verificationBadge" in APP_JS
+
+    def test_the_badge_is_shown_wherever_an_incident_status_is(self):
+        assert APP_JS.count("${verificationBadge(incident)}") == 3
+
+    def test_the_fix_card_reports_attempts_verification_and_escalation(self):
+        assert "attempt" in APP_JS
+        assert "remediation.verification" in APP_JS
+        assert "Escalated" in APP_JS
+
+    def test_execute_distinguishes_replays_and_dry_runs(self):
+        assert 'result.status === "dry_run"' in APP_JS
+        assert 'result.status === "already_executed"' in APP_JS
+
+    def test_new_audit_actions_are_offered_in_the_filter(self):
+        for action in (
+            "execute_replayed",
+            "execute_dry_run",
+            "execute_failed",
+            "execute_refused",
+            "remediation_verified",
+            "remediation_escalated",
+        ):
+            assert f'"{action}"' in APP_JS, action
+
+    def test_timeline_marks_verification_and_escalation(self):
+        assert ".kind-remediation_verified" in CSS
+        assert ".kind-remediation_escalated" in CSS

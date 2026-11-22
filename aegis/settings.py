@@ -8,9 +8,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from aegis.models import RemediationAction
+
 MAX_PORT = 65535
 # The engine's stop() waits grace + 5 s; with uvicorn's 10 s drain that must fit Compose's 30 s.
 MAX_SHUTDOWN_GRACE_SECONDS = 15
+MAX_REMEDIATION_ATTEMPTS = 10
+REMEDIATION_TARGETS = frozenset({"checkout", "inventory"})
+DEFAULT_REMEDIATION_ALLOWED = ",".join(
+    f"{target}:{action.value}" for target in sorted(REMEDIATION_TARGETS) for action in RemediationAction
+)
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
 
 
 class SettingsError(ValueError):
@@ -39,6 +48,23 @@ def _env_int(name: str, default: int) -> Any:
             return int(raw)
         except ValueError:
             return raw
+
+    return field(default_factory=parse)
+
+
+def _env_bool(name: str, default: bool) -> Any:
+    """Read a boolean environment variable; an unrecognised value is kept so validation names it."""
+
+    def parse() -> bool | str:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        lowered = raw.strip().lower()
+        if lowered in _TRUE:
+            return True
+        if lowered in _FALSE:
+            return False
+        return raw
 
     return field(default_factory=parse)
 
@@ -116,6 +142,18 @@ class Settings:
     detection_cycles: int = _env_int("AEGIS_DETECTION_CYCLES", 2)
     blind_seconds: int = _env_int("AEGIS_BLIND_SECONDS", 300)
     reopen_cooldown_seconds: int = _env_int("AEGIS_REOPEN_COOLDOWN_SECONDS", 300)
+    # Remediation safety
+    remediation_dry_run: bool = _env_bool("AEGIS_REMEDIATION_DRY_RUN", False)
+    remediation_max_attempts: int = _env_int("AEGIS_REMEDIATION_MAX_ATTEMPTS", 3)
+    remediation_backoff_ms: int = _env_int("AEGIS_REMEDIATION_BACKOFF_MS", 500)
+    remediation_timeout_seconds: int = _env_int("AEGIS_REMEDIATION_TIMEOUT_SECONDS", 5)
+    remediation_max_per_window: int = _env_int("AEGIS_REMEDIATION_MAX_PER_WINDOW", 5)
+    remediation_window_seconds: int = _env_int("AEGIS_REMEDIATION_WINDOW_SECONDS", 300)
+    remediation_verify_seconds: int = _env_int("AEGIS_REMEDIATION_VERIFY_SECONDS", 180)
+    remediation_verify_interval: int = _env_int("AEGIS_REMEDIATION_VERIFY_INTERVAL", 5)
+    remediation_allowed_actions_raw: str = _env(
+        "AEGIS_REMEDIATION_ALLOWED_ACTIONS", DEFAULT_REMEDIATION_ALLOWED
+    )
 
     def __post_init__(self) -> None:
         problems: list[str] = []
@@ -141,6 +179,13 @@ class Settings:
             "AEGIS_DETECTION_CYCLES": ("detection_cycles", 1),
             "AEGIS_BLIND_SECONDS": ("blind_seconds", 0),
             "AEGIS_REOPEN_COOLDOWN_SECONDS": ("reopen_cooldown_seconds", 0),
+            "AEGIS_REMEDIATION_MAX_ATTEMPTS": ("remediation_max_attempts", 1),
+            "AEGIS_REMEDIATION_BACKOFF_MS": ("remediation_backoff_ms", 0),
+            "AEGIS_REMEDIATION_TIMEOUT_SECONDS": ("remediation_timeout_seconds", 1),
+            "AEGIS_REMEDIATION_MAX_PER_WINDOW": ("remediation_max_per_window", 1),
+            "AEGIS_REMEDIATION_WINDOW_SECONDS": ("remediation_window_seconds", 1),
+            "AEGIS_REMEDIATION_VERIFY_SECONDS": ("remediation_verify_seconds", 0),
+            "AEGIS_REMEDIATION_VERIFY_INTERVAL": ("remediation_verify_interval", 1),
         }
         for env_name, (attr, minimum) in minimums.items():
             value = getattr(self, attr)
@@ -154,6 +199,15 @@ class Settings:
                 problems.append(
                     f"{env_name} must be at most {MAX_SHUTDOWN_GRACE_SECONDS}, got {value}"
                 )
+            elif attr == "remediation_max_attempts" and value > MAX_REMEDIATION_ATTEMPTS:
+                problems.append(
+                    f"{env_name} must be at most {MAX_REMEDIATION_ATTEMPTS}, got {value}"
+                )
+        if not isinstance(self.remediation_dry_run, bool):
+            problems.append(
+                f"AEGIS_REMEDIATION_DRY_RUN must be true or false, got {self.remediation_dry_run!r}"
+            )
+        problems.extend(self._allowed_actions_problems())
         for origin in self.cors_origins:
             problem = _origin_problem(origin)
             if problem:
@@ -162,6 +216,22 @@ class Settings:
             raise SettingsError(
                 "Invalid configuration:\n" + "\n".join(f"  - {item}" for item in problems)
             )
+
+    def _allowed_actions_problems(self) -> list[str]:
+        entries = [item.strip() for item in self.remediation_allowed_actions_raw.split(",") if item.strip()]
+        if not entries:
+            return ["AEGIS_REMEDIATION_ALLOWED_ACTIONS must list at least one target:action pair"]
+        actions = {action.value for action in RemediationAction}
+        problems = []
+        for entry in entries:
+            target, _, action = entry.partition(":")
+            if target not in REMEDIATION_TARGETS or action not in actions:
+                problems.append(
+                    f"AEGIS_REMEDIATION_ALLOWED_ACTIONS entry {entry!r} must be "
+                    f"target:action with target in {sorted(REMEDIATION_TARGETS)} and "
+                    f"action in {sorted(actions)}"
+                )
+        return problems
 
     @staticmethod
     def _url_problem(value: str) -> str | None:
@@ -178,6 +248,16 @@ class Settings:
     def cors_origins(self) -> tuple[str, ...]:
         """Browser origins allowed to call the API cross-origin; empty means same-origin only."""
         return tuple(item.strip().rstrip("/") for item in self.cors_origins_raw.split(",") if item.strip())
+
+    @property
+    def remediation_allowed_actions(self) -> frozenset[tuple[str, str]]:
+        """The (target, action) pairs the executor may run."""
+        pairs = (
+            item.strip().partition(":")
+            for item in self.remediation_allowed_actions_raw.split(",")
+            if item.strip()
+        )
+        return frozenset((target, action) for target, _, action in pairs)
 
     def ensure_dirs(self) -> None:
         """Create required directories if they don't exist."""

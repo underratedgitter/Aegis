@@ -79,7 +79,6 @@ engine = SupervisedEngine(
 )
 # One investigator for manual and automatic investigations, so they share the LLM breaker.
 engine.agent = agent
-remediation = RemediationExecutor(settings, store)
 REGISTRY.register(ControlPlaneCollector(store, engine))
 
 # ─── Audit Log ────────────────────────────────────────────────────────────────
@@ -91,6 +90,9 @@ _audit_log: deque[dict[str, Any]] = deque(maxlen=AUDIT_LOG_MAX_ENTRIES)
 def _audit(action: str, detail: dict[str, Any]) -> None:
     """Record an audit event. The buffer is bounded; oldest entries are dropped."""
     _audit_log.append({"action": action, "at": utc_now(), **detail})
+
+
+remediation = RemediationExecutor(settings, store, telemetry=telemetry, audit=_audit)
 
 
 # ─── Rate Limiting ────────────────────────────────────────────────────────────
@@ -176,6 +178,7 @@ PROTECTED = [Depends(verify_api_key)]
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     _warn_if_unauthenticated()
     store.recover_interrupted_executions()
+    remediation.resume_verifications()
     engine.start()
     try:
         yield
@@ -184,8 +187,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
             engine.stop()
         finally:
-            telemetry.close()
+            # Verification threads read telemetry and write the store, so they stop first.
             remediation.close()
+            telemetry.close()
             store.close()
 
 
@@ -359,7 +363,7 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
     for inc in pending:
         rec = inc["data"].get("recommendation") or {}
         try:
-            remediation.validate_recommendation(rec)
+            remediation.ensure_permitted(rec)
         except RemediationError:
             continue
         approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}
@@ -405,7 +409,7 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
     recommendation = incident["data"].get("recommendation") or {}
     try:
-        remediation.validate_recommendation(recommendation)
+        remediation.ensure_permitted(recommendation)
     except RemediationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": recommendation}
@@ -424,8 +428,9 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
     try:
         result = remediation.execute(incident_id, request.approver)
     except RemediationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _audit("execute", {"incident_id": incident_id, "approver": request.approver})
+        # 409 refused, 429 over the limit, 502 the service did not accept the action.
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(status_code=exc.status_code, detail=str(exc), headers=headers) from exc
     return ExecuteResponse(**result)
 
 

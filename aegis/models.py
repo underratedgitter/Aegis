@@ -20,6 +20,24 @@ class IncidentStatus(StrEnum):
     CLOSED = "closed"
 
 
+class ExecutionState(StrEnum):
+    """Lifecycle of one remediation execution record (one per idempotency key)."""
+
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"  # known not to have been applied; safe to try again
+    UNKNOWN = "unknown"  # may have been applied; must be reconciled before another attempt
+
+
+class VerificationState(StrEnum):
+    """Outcome of re-checking the triggering signal after a successful action."""
+
+    VERIFYING = "verifying"
+    VERIFIED = "verified"
+    FAILED = "failed"  # the action succeeded but the signal still fires: escalated
+    UNVERIFIED = "unverified"  # the signal could not be read in the window: escalated
+
+
 class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -189,11 +207,16 @@ class ApprovalResponse(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
+    """"executed", "already_executed" (this approval ran before) or "dry_run" (nothing changed)."""
+
     status: str = "executed"
     incident_id: str
     action: str
     target: str
     result: dict[str, Any]
+    idempotency_key: str | None = None
+    attempts: int | None = None
+    verification: str | None = None
 
 
 class MetricSnapshot(BaseModel):
