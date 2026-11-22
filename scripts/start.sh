@@ -5,6 +5,9 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
+# shellcheck source=scripts/ports.sh
+source "$project_dir/scripts/ports.sh"
+
 # Fault injection and remediation are disabled without a shared admin key.
 # Generate a local key once so `make start` keeps the demo usable.
 if [[ -z "${AEGIS_API_KEY:-}" ]]; then
@@ -21,18 +24,9 @@ if [[ -z "${AEGIS_API_KEY:-}" ]]; then
 fi
 
 grafana_port="${GRAFANA_PORT:-3001}"
+checkout_port="${CHECKOUT_PORT:-8080}"
 open_browser="${OPEN_BROWSER:-1}"
 auto_start_docker="${AUTO_START_DOCKER:-1}"
-
-port_in_use() {
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
-  elif command -v nc >/dev/null 2>&1; then
-    nc -z 127.0.0.1 "$1" >/dev/null 2>&1
-  else
-    return 1
-  fi
-}
 
 docker_server_ready() {
   local server_version
@@ -55,15 +49,30 @@ if ! docker_server_ready; then
   fi
 fi
 
-if [[ -z "${GRAFANA_PORT:-}" ]]; then
-  original_grafana_port="$grafana_port"
-  while port_in_use "$grafana_port"; do
-    grafana_port=$((grafana_port + 1))
-  done
+# Ports this stack publishes besides the two that can move; never auto-pick them.
+fixed_ports=(8000 8081 9091 3100)
 
-  if [[ "$grafana_port" != "$original_grafana_port" ]]; then
-    export GRAFANA_PORT="$grafana_port"
-    echo "Grafana port ${original_grafana_port} is busy; using ${grafana_port}."
+# The port a running stack already publishes, so a re-run keeps it instead of treating it as busy.
+published_port() {
+  docker compose port "$1" "$2" 2>/dev/null | tail -1 | sed 's/.*://' || true
+}
+
+# An explicit GRAFANA_PORT / CHECKOUT_PORT always wins. Otherwise reuse the port saved in the
+# env file while it is free, else take the next free one and save it so that a later plain
+# `docker compose up` publishes the same port.
+if [[ -z "${GRAFANA_PORT:-}" ]]; then
+  grafana_port="$(select_port GRAFANA_PORT 3001 "$(published_port grafana 3000)" "${fixed_ports[@]}" 8080)"
+  export GRAFANA_PORT="$grafana_port"
+  if [[ "$grafana_port" != "3001" ]]; then
+    echo "Grafana port 3001 is busy; using ${grafana_port} (saved to .env)."
+  fi
+fi
+
+if [[ -z "${CHECKOUT_PORT:-}" ]]; then
+  checkout_port="$(select_port CHECKOUT_PORT 8080 "$(published_port checkout 8000)" "${fixed_ports[@]}" "$grafana_port")"
+  export CHECKOUT_PORT="$checkout_port"
+  if [[ "$checkout_port" != "8080" ]]; then
+    echo "Checkout port 8080 is busy; using ${checkout_port} (saved to .env)."
   fi
 fi
 
@@ -74,7 +83,7 @@ urls=(
   "http://localhost:8000"
   "http://localhost:${grafana_port}"
   "http://localhost:9091"
-  "http://localhost:8080"
+  "http://localhost:${checkout_port}"
   "http://localhost:8081"
 )
 

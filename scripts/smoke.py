@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from urllib.request import urlopen
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkout-url", default="http://localhost:8080")
+    parser.add_argument("--checkout-url", default=f"http://localhost:{os.getenv('CHECKOUT_PORT', '8080')}")
     parser.add_argument("--count", type=int, default=20)
     args = parser.parse_args()
     for _ in range(args.count):

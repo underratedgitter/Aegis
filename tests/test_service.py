@@ -113,3 +113,14 @@ def test_repeated_cpu_injection_replaces_the_previous_burner():
         assert second is not first
     finally:
         state.clear()
+
+
+def test_admin_routes_reject_a_non_ascii_token_with_401(monkeypatch):
+    monkeypatch.setenv("AEGIS_API_KEY", "test-key")
+    client = TestClient(app)
+
+    response = client.get(
+        "/admin/faults", headers={"Authorization": "Bearer caf\u00e9".encode("latin-1")}
+    )
+
+    assert response.status_code == 401

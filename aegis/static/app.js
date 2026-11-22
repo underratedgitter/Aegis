@@ -1,7 +1,61 @@
 let selectedIncident = null;
 let allIncidents = [];
+const TIMELINE_LIMIT = 20;
 
 const $ = (id) => document.getElementById(id);
+
+// The page re-renders on every 5 s poll. Replacing unchanged markup makes it flash and drops
+// hover, focus, selection and scroll position, so write only what actually changed.
+const renderedHtml = new WeakMap();
+
+function syncAttributes(current, wanted) {
+  for (const {name} of [...current.attributes]) if (!wanted.hasAttribute(name)) current.removeAttribute(name);
+  for (const {name, value} of wanted.attributes) if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+}
+
+// Patch the children of `parent` in place to match `wanted`, keeping every node that is unchanged.
+function patchChildren(parent, wanted) {
+  const target = wanted.childNodes;
+  for (let i = 0; i < target.length; i++) {
+    const next = target[i];
+    const current = parent.childNodes[i];
+    if (!current) parent.appendChild(next.cloneNode(true));
+    else if (current.nodeName !== next.nodeName) parent.replaceChild(next.cloneNode(true), current);
+    else if (next.nodeType === Node.ELEMENT_NODE) {
+      syncAttributes(current, next);
+      patchChildren(current, next);
+    } else if (current.data !== next.data) current.data = next.data;
+  }
+  while (parent.childNodes.length > target.length) parent.lastChild.remove();
+}
+
+function setHtml(id, html) {
+  const el = $(id);
+  if (renderedHtml.get(el) === html) return;
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  patchChildren(el, template.content);
+  renderedHtml.set(el, html);
+}
+
+// Writing identical text or classes still queues DOM mutations; skip them.
+function setText(id, text) {
+  const el = $(id);
+  if (el.textContent === text) return;
+  // Update the existing text node in place instead of replacing it.
+  if (el.firstChild?.nodeType === Node.TEXT_NODE && !el.firstChild.nextSibling) el.firstChild.data = text;
+  else el.textContent = text;
+}
+
+function setClass(id, className) {
+  const el = $(id);
+  if (el.className !== className) el.className = className;
+}
+
+function setHidden(id, hidden) {
+  const el = $(id);
+  if (el.classList.contains("hidden") !== hidden) el.classList.toggle("hidden", hidden);
+}
 const fmt = (value) => value == null ? "—" : typeof value === "number" ? value.toFixed(value < 1 ? 3 : 1) : value;
 
 // The key lives only in sessionStorage; storage can be blocked, so never let it throw.
@@ -44,49 +98,49 @@ async function getJson(url, options) {
 async function refresh() {
   try {
     const [overview, metrics] = await Promise.all([getJson("/api/overview"), getJson("/api/metrics")]);
-    $("engine-status").textContent = "engine online";
-    $("engine-status").className = "pill";
-    $("last-updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
-    $("open-incidents").textContent = overview.open_incidents;
-    $("mttr").textContent = overview.mttr_seconds == null ? "—" : `${overview.mttr_seconds}s`;
+    setText("engine-status", "engine online");
+    setClass("engine-status", "pill");
+    setText("last-updated", `Updated ${new Date().toLocaleTimeString()}`);
+    setText("open-incidents", String(overview.open_incidents));
+    setText("mttr", overview.mttr_seconds == null ? "—" : `${overview.mttr_seconds}s`);
     const availableTelemetry = [overview.telemetry.prometheus.available, overview.telemetry.loki.available].filter(Boolean).length;
-    $("telemetry").textContent = `${availableTelemetry}/2`;
-    $("services").textContent = `${overview.services.filter((s) => s.available).length}/2`;
+    setText("telemetry", `${availableTelemetry}/2`);
+    setText("services", `${overview.services.filter((s) => s.available).length}/2`);
     const budget = overview.slos?.[0]?.error_budget_remaining;
-    $("error-budget").textContent = budget == null ? "—" : `${(budget * 100).toFixed(0)}%`;
+    setText("error-budget", budget == null ? "—" : `${(budget * 100).toFixed(0)}%`);
     allIncidents = overview.incidents;
     // Re-apply the active search/filters; rendering the raw list wiped them every 5s poll.
     filterIncidents();
     renderMetrics(metrics);
     if (selectedIncident) await showIncident(selectedIncident);
   } catch (error) {
-    $("engine-status").textContent = "disconnected";
-    $("engine-status").className = "pill muted";
-    $("last-updated").textContent = error.message;
+    setText("engine-status", "disconnected");
+    setClass("engine-status", "pill muted");
+    setText("last-updated", error.message);
   }
 }
 
 function renderIncidents(incidents) {
-  $("incident-count").textContent = incidents.length;
+  setText("incident-count", String(incidents.length));
   if (!incidents.length) {
-    $("incident-list").innerHTML = `<div class="empty">No incidents found.<br><span>Try adjusting your filters or inject a fault.</span></div>`;
+    setHtml("incident-list", `<div class="empty">No incidents found.<br><span>Try adjusting your filters or inject a fault.</span></div>`);
     return;
   }
-  $("incident-list").innerHTML = incidents.map((incident) => `
+  setHtml("incident-list", incidents.map((incident) => `
     <div class="incident-item ${selectedIncident === incident.id ? "selected" : ""}" onclick="showIncident('${incident.id}')">
       <span class="severity severity-${incident.severity}">${incident.severity} · ${escapeHtml(incident.root_cause_key)}</span>
       <h3>${escapeHtml(incident.title)}</h3>
       <p>${incident.status.replaceAll("_", " ")} · ${new Date(incident.last_seen).toLocaleTimeString()}</p>
     </div>
-  `).join("");
+  `).join(""));
 }
 
 function renderMetrics(metrics) {
-  $("metrics").innerHTML = metrics.map((metric) => {
+  setHtml("metrics", metrics.map((metric) => {
     const value = metric.value == null ? 0 : metric.value;
     const width = Math.min(100, Math.max(4, value * (metric.name.includes("rate") ? 100 : 70)));
     return `<div class="metric-row"><span>${metric.name.replaceAll("_", " ")}</span><span>${fmt(metric.value)}</span><div class="bar"><i style="width:${width}%"></i></div></div>`;
-  }).join("");
+  }).join(""));
 }
 
 function filterIncidents() {
@@ -111,38 +165,41 @@ function filterIncidents() {
 async function showIncident(id) {
   selectedIncident = id;
   const incident = await getJson(`/api/incidents/${id}`);
-  $("detail-empty").classList.add("hidden");
-  $("detail").classList.remove("hidden");
-  $("detail-severity").innerHTML = `<span class="severity severity-${incident.severity}">${incident.severity} · ${escapeHtml(incident.root_cause_key)}</span>`;
-  $("detail-title").textContent = incident.title;
-  $("detail-meta").textContent = `${incident.id} · detected ${new Date(incident.first_seen).toLocaleString()}`;
-  $("detail-status").textContent = incident.status.replaceAll("_", " ");
-  $("detail-status").className = `status status-${incident.status}`;
+  setHidden("detail-empty", true);
+  setHidden("detail", false);
+  setHtml("detail-severity", `<span class="severity severity-${incident.severity}">${incident.severity} · ${escapeHtml(incident.root_cause_key)}</span>`);
+  setText("detail-title", incident.title);
+  setText("detail-meta", `${incident.id} · detected ${new Date(incident.first_seen).toLocaleString()}`);
+  setText("detail-status", incident.status.replaceAll("_", " "));
+  setClass("detail-status", `status status-${incident.status}`);
 
   const investigation = incident.data.investigation;
   const recommendation = incident.data.recommendation;
 
-  $("hypothesis").textContent = investigation?.hypothesis || "The agent is still collecting evidence…";
-  $("evidence").innerHTML = (investigation?.evidence || []).slice(0, 8).map((item) =>
+  setText("hypothesis", investigation?.hypothesis || "The agent is still collecting evidence…");
+  setHtml("evidence", (investigation?.evidence || []).slice(0, 8).map((item) =>
     `<div class="evidence-item"><span>${escapeHtml(item.source)} · ${escapeHtml(item.label || "observation")}</span>${escapeHtml(item.detail || "")}</div>`
-  ).join("") || `<div class="empty">No agent evidence yet.</div>`;
+  ).join("") || `<div class="empty">No agent evidence yet.</div>`);
 
-  $("timeline").innerHTML = incident.events.map((event) =>
+  // An open incident logs events every cycle; rendering them all makes the page grow on each poll.
+  const events = incident.events.slice(-TIMELINE_LIMIT);
+  const hidden = incident.events.length - events.length;
+  setHtml("timeline", (hidden ? `<div class="timeline-more">${hidden} earlier events not shown</div>` : "") + events.map((event) =>
     `<div class="timeline-item"><small>${new Date(event.at).toLocaleTimeString()} · ${escapeHtml(event.kind)}</small><p>${escapeHtml(event.message)}</p></div>`
-  ).join("");
+  ).join(""));
 
   if (recommendation) {
     const approved = incident.status === "approved";
-    $("recommendation-card").innerHTML = `
+    setHtml("recommendation-card", `
       <h3>▣ Proposed safe remediation</h3>
       <p><strong>${escapeHtml(recommendation.action)}</strong> on <strong>${escapeHtml(recommendation.target)}</strong> · ${escapeHtml(recommendation.reason || "")}</p>
       <div class="rec-actions">
         ${incident.status === "recommendation_pending" ? `<button onclick="approveIncident('${id}')">Approve</button>` : ""}
         ${approved ? `<button onclick="executeIncident('${id}')">Execute fix</button>` : ""}
         ${incident.status === "open" ? `<button class="secondary" onclick="investigateIncident('${id}')">Re-investigate</button>` : ""}
-      </div>`;
+      </div>`);
   } else {
-    $("recommendation-card").innerHTML = "";
+    setHtml("recommendation-card", "");
   }
 }
 

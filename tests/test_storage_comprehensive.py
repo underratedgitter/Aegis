@@ -168,3 +168,48 @@ class TestStore:
         incidents = store.list_incidents(limit=100)
         assert len(incidents) == 50
         store.close()
+
+
+def test_evidence_history_is_capped_at_the_configured_size(tmp_path):
+    store = Store(str(tmp_path / "db.sqlite"), max_evidence=3)
+    for value in range(5):
+        incident, _ = store.upsert_incident("inc-cap", "t", "high", "service:cap", {"value": value})
+
+    assert [item["value"] for item in incident["data"]["evidence"]] == [2, 3, 4]
+
+
+def test_transition_status_is_a_compare_and_swap(tmp_path):
+    store = Store(str(tmp_path / "db.sqlite"))
+    store.upsert_incident("inc-cas", "t", "high", "service:cas", {})
+    store.update_incident("inc-cas", status="approved")
+
+    assert store.transition_status("inc-cas", "approved", "executing") is True
+    assert store.transition_status("inc-cas", "approved", "executing") is False
+    assert store.transition_status("missing", "approved", "executing") is False
+    assert store.get_incident("inc-cas")["status"] == "executing"
+
+
+def test_recover_interrupted_executions_returns_them_to_approved_with_an_event(tmp_path):
+    store = Store(str(tmp_path / "db.sqlite"))
+    for incident_id, status in [("inc-stuck", "executing"), ("inc-done", "resolved")]:
+        store.upsert_incident(incident_id, "t", "high", f"service:{incident_id}", {})
+        store.update_incident(incident_id, status=status)
+
+    assert store.recover_interrupted_executions() == ["inc-stuck"]
+
+    assert store.get_incident("inc-stuck")["status"] == "approved"
+    assert store.get_incident("inc-done")["status"] == "resolved"
+    event = store.events("inc-stuck")[-1]
+    assert event["kind"] == "recovery"
+    assert "interrupted" in event["message"]
+    assert store.recover_interrupted_executions() == []
+
+
+def test_executing_incidents_are_listed_before_resolved_ones(tmp_path):
+    store = Store(str(tmp_path / "db.sqlite"))
+    store.upsert_incident("inc-old-exec", "t", "high", "service:a", {})
+    store.update_incident("inc-old-exec", status="executing", last_seen="2020-01-01T00:00:00+00:00")
+    store.upsert_incident("inc-new-done", "t", "high", "service:b", {})
+    store.update_incident("inc-new-done", status="resolved")
+
+    assert [i["id"] for i in store.list_incidents()] == ["inc-old-exec", "inc-new-done"]

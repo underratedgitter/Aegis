@@ -62,7 +62,7 @@ and opens the local pages automatically. Published ports bind to `127.0.0.1` by 
 - Aegis control room: <http://localhost:8000>
 - Grafana: <http://localhost:3001> (or `3002` if 3001 is occupied; default credentials: `admin` / `admin`)
 - Prometheus: <http://localhost:9091>
-- Checkout: <http://localhost:8080>
+- Checkout: <http://localhost:8080> (or the next free port if 8080 is occupied)
 - Inventory: <http://localhost:8081>
 
 On macOS, you can also double-click [`start.command`](start.command) to run the same startup
@@ -75,6 +75,16 @@ Grafana port. You can also choose one explicitly without changing the other serv
 GRAFANA_PORT=3002 make start
 ```
 
+The checkout port (8080) is handled the same way: `make start` picks the next free port, or set
+`CHECKOUT_PORT=8082 make start`.
+
+A port that `make start` picks itself is saved to `.env` (as `CHECKOUT_PORT` / `GRAFANA_PORT`, next to
+`AEGIS_API_KEY`), because `docker compose` reads that file too. A later plain `docker compose up`
+therefore publishes the same ports instead of falling back to 8080 and failing while it is busy. Re-runs
+are stable: the saved port is reused while it is free (or already published by this stack), otherwise
+the next free port is chosen and the saved value is updated. Ports you pass explicitly are never
+written. Ports used by the other services (8000, 8081, 9091, 3100) are never auto-picked.
+
 Fault injection, approval, and execution are protected by a shared `AEGIS_API_KEY`. If none is set,
 `make start` generates one and appends it to `.env`. Paste it into the control room's **API key**
 box before using the action buttons; the key is kept in the browser's session storage. Without a
@@ -86,7 +96,7 @@ The control room is the recommended demo surface. If you want traffic before inj
 python3 scripts/smoke.py --count 100
 ```
 
-`scripts/smoke.py` defaults to `--checkout-url http://localhost:8080` and `--count 20`.
+`scripts/smoke.py` defaults to `--checkout-url http://localhost:$CHECKOUT_PORT` (8080 when unset) and `--count 20`.
 
 Or inject a failure from a terminal, passing the key from `.env`:
 
@@ -156,8 +166,10 @@ Read endpoints are open. State-changing endpoints (`POST` routes and `GET /api/a
 ### Control plane
 
 ```bash
-# Liveness and current state
+# Liveness and readiness
 curl http://localhost:8000/healthz
+curl http://localhost:8000/readyz
+# Current state
 curl http://localhost:8000/api/overview
 
 # Force one engine evaluation
@@ -182,6 +194,8 @@ curl -X POST http://localhost:8000/api/incidents/<incident-id>/execute \
   -H 'content-type: application/json' -d '{"approver":"demo-operator"}'
 ```
 
+`GET /readyz` returns HTTP 503 (`status: unavailable`) when the SQLite database cannot be queried or the incident-engine thread has stopped. Prometheus and Loki being down only report `status: degraded` with HTTP 200, because Aegis can still serve and record incidents without them. Compose uses `/readyz` for the control plane and `/healthz` for the demo services.
+
 Other control-plane routes:
 - `POST /api/incidents/batch/approve` (requires key): Batch-approve all incidents in `recommendation_pending`.
 - `POST /api/chaos` (requires key): Inject bounded faults into demo services (`service`, `fault`, `duration_seconds`, `intensity`).
@@ -192,11 +206,20 @@ Other control-plane routes:
 
 The control plane rate-limits each client (default 100 requests per 60 seconds; configurable via `AEGIS_RATE_LIMIT_MAX` and `AEGIS_RATE_LIMIT_WINDOW`).
 
+#### HTTP hardening
+
+- **Failed-key lockout:** a client that presents a wrong bearer token `AEGIS_AUTH_FAIL_MAX` times (default 10) within `AEGIS_AUTH_FAIL_WINDOW` seconds (default 60) receives `429` with a `Retry-After` header on protected routes, even if it then sends the right key. Requests with no token are not counted. The counters are in memory and per process, keyed by the TCP peer address; behind a reverse proxy every client shares the proxy's address, so apply per-client limits at the proxy as well. The demo services' admin routes use the same lockout.
+- **Request size:** bodies larger than `AEGIS_MAX_BODY_BYTES` (default 65536) are refused with `413`, whether declared by `Content-Length` or streamed. `approver` must be 2-80 plain characters (letters, digits, space, `. _ @ + -`), and request bodies reject unknown fields.
+- **Security headers:** every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and a `Content-Security-Policy` (`default-src 'self'`, no external origins, inline handlers only via `script-src-attr`; `/docs` and `/redoc` get a relaxed policy so Swagger UI can load from jsDelivr; the demo services send `default-src 'none'`). `Strict-Transport-Security` is added when the request arrived over HTTPS, so terminate TLS in front of Aegis for anything beyond localhost.
+- **CORS:** disabled by default, so browsers only allow same-origin use (the bundled control room needs nothing). To let another web origin call the API, set `AEGIS_CORS_ORIGINS` to a comma-separated list of origins such as `https://ops.example.com,http://localhost:3000`. Wildcards and paths are rejected, credentials are never allowed, and only `GET`/`POST` with the `Authorization`, `Content-Type` and `X-Request-Id` headers are permitted.
+- **Startup checks:** invalid configuration (a non-integer or out-of-range number, a malformed URL or port, a bad CORS origin) stops the process at startup with a message listing every problem, instead of silently falling back to a default. When `AEGIS_API_KEY` is unset the demo still runs, but a `SECURITY WARNING` is logged on every start: approve, execute, investigate and audit routes are then open to anyone who can reach the port. Always set a key for a shared or production deployment.
+
 ### Demo services (Checkout & Inventory)
 
 Each demo service also exposes its own application and admin endpoints:
 
-- `GET /healthz` — Service liveness check.
+- `GET /healthz` — Service liveness check (no dependencies, always cheap).
+- `GET /readyz` — Readiness: `checks.dependency` reports whether the `DEPENDENCY_URL` service answers (`ok`/`unavailable`). A down dependency yields `status: degraded` but still HTTP 200.
 - `GET /metrics` — Prometheus metrics scrape target.
 - `GET /api/checkout` (Checkout: port 8080) — Process an order and call the inventory dependency.
 - `GET /api/inventory` (Inventory: port 8081) — Check inventory availability for the demo SKU.
@@ -231,7 +254,60 @@ PORT=8080 DEPENDENCY_URL=http://localhost:8081 python3 -m aegis.service_main
 python3 -m aegis.control_main
 ```
 
-Each service and control-plane process listens on `PORT` (default 8000). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `OPENAI_MODEL` (default `gpt-4.1-mini`), and `AEGIS_API_KEY`; see `aegis/settings.py`. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
+Each service and control-plane process listens on `PORT` (default 8000) on `AEGIS_HOST` (default `0.0.0.0`; use `127.0.0.1` when running locally outside a container). The control plane reads `PROMETHEUS_URL` (default `http://localhost:9090`), `LOKI_URL` (default `http://localhost:3100`), `CHECKOUT_URL` (default `http://localhost:8080`), `INVENTORY_URL` (default `http://localhost:8081`), `AEGIS_DB_PATH` (default `./data/aegis.db`), `AEGIS_LOG_DIR` (default `./logs`), `AEGIS_RUNBOOK_DIR` (default `./runbooks`), `AEGIS_POLL_SECONDS` (default `5`), `AEGIS_RESOLUTION_CYCLES` (default `2`), `AEGIS_MAX_EVIDENCE` (default `100`), `AEGIS_SIGNAL_EVENT_INTERVAL` (default `60`, seconds; `0` records every poll), `OPENAI_MODEL` (default `gpt-4.1-mini`), `AEGIS_API_KEY`, `AEGIS_RATE_LIMIT_MAX` (default `100`), `AEGIS_RATE_LIMIT_WINDOW` (default `60`), `AEGIS_AUTH_FAIL_MAX` (default `10`), `AEGIS_AUTH_FAIL_WINDOW` (default `60`), `AEGIS_MAX_BODY_BYTES` (default `65536`), and `AEGIS_CORS_ORIGINS` (default empty, same-origin only); see `aegis/settings.py` and [HTTP hardening](#http-hardening). Malformed values abort startup with an error naming the variable. If you reuse the Compose Prometheus, it is published on host port 9091, so set `PROMETHEUS_URL=http://localhost:9091`.
+
+## Reliability
+
+The engine is built to keep running when its dependencies do not.
+
+- **Timeouts and retries.** Prometheus queries use a 1 s connect and 3 s read timeout. They are idempotent reads, so transport errors and HTTP 429/502/503/504 are retried up to 3 attempts in total, with 0.25 s then 0.5 s backoff. After a query exhausts its retries, further Prometheus queries fail fast for 10 s instead of each waiting out the full retry budget. The services' admin API (remediation) uses a 2 s connect and 5 s read timeout and is never retried automatically, because it changes state.
+- **Outages do not close incidents.** If a rule's Prometheus query fails, the engine skips it: the anomaly baseline is not updated, no healthy cycle is counted, and the incident gets one `telemetry_unavailable` event. Incidents only auto-resolve after consecutive successful, below-threshold readings.
+- **One failure does not stop the loop.** Each rule is evaluated independently; engine errors are logged (with traceback) and the next cycle runs after `AEGIS_POLL_SECONDS` (minimum 1 s). A crashed investigation records an `agent_error` event and returns the incident to `open`. Incidents left in `investigating` by a restart are investigated again at startup.
+- **Bounded LLM investigator.** With `OPENAI_API_KEY` set, each request times out after 20 s (one SDK retry), the whole investigation has a 60 s budget, at most 6 tool rounds with 8 tool calls each, tool results are cut to 8,000 characters and the whole prompt to 60,000. Any breach, malformed answer, or recommendation outside the remediation allowlist falls back to the local investigator, and the reason is stored as `fallback_reason`. Tool errors are returned to the model rather than aborting.
+- **Quiet timelines.** The engine appends evidence on every poll, but an open incident's timeline gets a "Signal still active" event only when a rule starts firing for that incident or at most once per `AEGIS_SIGNAL_EVENT_INTERVAL` seconds (default 60) per rule, so a long incident does not add two events every 5 s poll. The evidence history (bounded by `AEGIS_MAX_EVIDENCE`) is unaffected.
+- **No lost updates.** Investigation results, approvals and remediation results are merged into the incident under the store lock, so evidence appended while they run is kept, and two concurrent approvals cannot both succeed (the second gets HTTP 409).
+- **Remediation failures are explicit.** A failed Execute records a `remediation_failed` event that says whether the target may have applied the request (for example after a read timeout), then returns the incident to `approved` so an operator can check and retry.
+
+These limits are constants in `aegis/telemetry.py`, `aegis/agent.py` and `aegis/remediation.py`.
+
+## Operations
+
+### Containers
+
+- The image runs as the unprivileged user `aegis` (uid 10001), installs runtime dependencies only, and has a built-in `HEALTHCHECK` on `/healthz`.
+- Compose runs the Aegis containers with a read-only root filesystem (`/tmp` is a tmpfs), all Linux capabilities dropped, `no-new-privileges`, an init process, rotated container logs (10 MB x 3), and `restart: unless-stopped`. Checkout waits for a healthy inventory; the control plane waits for all of its dependencies.
+- Compose passes `AEGIS_CORS_ORIGINS`, `AEGIS_AUTH_FAIL_MAX`, `AEGIS_AUTH_FAIL_WINDOW` and `AEGIS_MAX_BODY_BYTES` to all three Aegis containers and `AEGIS_SIGNAL_EVENT_INTERVAL` to the control plane, each with the default from `aegis/settings.py`; set them in the shell or `.env`.
+- Third-party images are pinned to explicit versions in `docker-compose.yml`; bump them deliberately.
+- Upgrading an existing stack: volumes created by an earlier (root) image are not writable by uid 10001. Fix ownership once:
+
+  ```bash
+  docker compose run --rm --no-deps --user root --cap-add CHOWN control chown -R aegis:aegis /data /var/log/aegis
+  ```
+
+### Graceful shutdown
+
+On `SIGTERM` (`docker compose stop`/`down`) uvicorn drains open requests for up to 10 s, then the control plane stops the incident engine, waits up to 15 s for its in-flight evaluation and investigations, and only then closes the database (checkpointing the WAL). Compose allows 30 s (`stop_grace_period`) before `SIGKILL`.
+
+### Database and backups
+
+Incident history lives in SQLite at `AEGIS_DB_PATH` (Compose: the `aegis-data` volume at `/data`). It runs in WAL mode with `synchronous=NORMAL` and a 10 s busy timeout, so reads do not block the engine and brief lock contention is retried instead of failing.
+
+Back it up while the stack is running (do not copy the `.db` file by hand: with WAL it is incomplete without its `-wal` file):
+
+```bash
+make backup    # writes ./backups/aegis-<UTC timestamp>.db, integrity-checked
+```
+
+This uses SQLite's online backup API via `python -m aegis.backup_main [DEST]` (default destination: `backups/aegis-<timestamp>.db` next to `AEGIS_DB_PATH`; an existing file is never overwritten). Outside Docker, run the same command with `AEGIS_DB_PATH` set, or use `sqlite3 aegis.db ".backup 'copy.db'"`.
+
+Restore by stopping the control plane, replacing the database, and starting it again:
+
+```bash
+docker compose stop control
+docker compose run --rm --no-deps -v "$PWD/backups:/restore:ro" control sh -c \
+  'rm -f /data/aegis.db-wal /data/aegis.db-shm && cp /restore/aegis-<timestamp>.db /data/aegis.db'
+docker compose start control
+```
 
 ## Safety model and design decisions
 
@@ -262,6 +338,8 @@ Or call its interpreter directly:
 ```bash
 GRAFANA_PORT=3002 make start
 ```
+
+An explicit port is used as given and is not saved to `.env`; automatically chosen ports are (see [Run Aegis](#run-aegis)).
 
 ### Inspect or stop the stack
 

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aegis.models import (
     Evidence,
+    Investigation,
     InvestigationMode,
     Recommendation,
     RemediationAction,
 )
+from aegis.remediation import RemediationExecutor
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
@@ -20,6 +24,32 @@ if TYPE_CHECKING:
 
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
+
+logger = logging.getLogger(__name__)
+
+# Bounds for the OpenAI investigation. Any breach raises, and ``investigate``
+# falls back to the deterministic local investigation.
+LLM_REQUEST_TIMEOUT_SECONDS = 20.0
+LLM_MAX_RETRIES = 1
+LLM_DEADLINE_SECONDS = 60.0
+LLM_MAX_TOOL_ROUNDS = 6
+LLM_MAX_TOOL_CALLS_PER_ROUND = 8
+PROMPT_MAX_CHARS = 60_000
+PROMPT_EVIDENCE_ITEMS = 5
+TOOL_RESULT_MAX_CHARS = 8_000
+RUNBOOK_MAX_CHARS = 20_000
+FALLBACK_REASON_MAX_CHARS = 300
+
+# Statuses in which a finished investigation may (re)propose a recommendation.
+# Later statuses keep their status: the approved proposal is stored separately.
+_REVIEWABLE_STATUSES = frozenset({"open", "investigating", "recommendation_pending"})
+
+
+def _clip(text: str, limit: int) -> str:
+    """Truncate text to a character budget, saying how much was cut."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
 
 
 class AgentInvestigator:
@@ -52,20 +82,33 @@ class AgentInvestigator:
             try:
                 result = self._llm_investigation(incident)
                 result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
+                # Reject malformed LLM output before it is stored or proposed for approval.
+                Investigation.model_validate(result)
+                # A proposal the executor would refuse can never be approved; fail it here.
+                RemediationExecutor.validate_recommendation(result["recommendation"])
             except Exception as exc:
+                logger.warning("LLM investigation of %s failed: %s", incident_id, exc)
                 result = self._local_investigation(incident)
                 result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
-                result["fallback_reason"] = str(exc)
+                result["fallback_reason"] = _clip(
+                    f"{type(exc).__name__}: {exc}", FALLBACK_REASON_MAX_CHARS
+                )
         else:
             result = self._local_investigation(incident)
             result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
 
-        data = {
-            **incident["data"],
-            "investigation": result,
-            "recommendation": result["recommendation"],
-        }
-        self.store.update_incident(incident_id, status="recommendation_pending", data=data)
+        # Merge under the store lock: the snapshot read above is stale by now, and
+        # writing it back would drop evidence appended while the investigation ran.
+        data = {"investigation": result, "recommendation": result["recommendation"]}
+        updated = self.store.merge_incident(
+            incident_id,
+            data,
+            status="recommendation_pending",
+            only_if_status=_REVIEWABLE_STATUSES,
+        )
+        if updated is None:
+            # Approved, executing or resolved while we worked: keep the status.
+            self.store.merge_incident(incident_id, data)
         self.store.add_event(
             incident_id,
             "agent_completed",
@@ -77,11 +120,14 @@ class AgentInvestigator:
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
         """Perform investigation using local tools without LLM."""
         root = incident["root_cause_key"]
-        metrics = self._call_tool("get_current_metrics", {}, incident["id"])
-        logs = self._call_tool("get_recent_logs", {"limit": 12}, incident["id"])
-        timeline = self._call_tool("get_incident_timeline", {}, incident["id"])
+        incident_id = incident["id"]
+        metrics = self._local_tool("get_current_metrics", {}, incident_id, [])
+        logs = self._local_tool("get_recent_logs", {"limit": 12}, incident_id, [])
+        timeline = self._local_tool("get_incident_timeline", {}, incident_id, [])
         runbook_slug = self._runbook_slug(root)
-        runbook = self._call_tool("read_runbook", {"slug": runbook_slug}, incident["id"])
+        runbook = self._local_tool(
+            "read_runbook", {"slug": runbook_slug}, incident_id, "Runbook unavailable."
+        )
 
         evidence = [
             Evidence(
@@ -130,6 +176,16 @@ class AgentInvestigator:
             "generated_at": utc_now(),
         }
 
+    def _local_tool(
+        self, name: str, arguments: dict[str, Any], incident_id: str, default: Any
+    ) -> Any:
+        """Run a tool for the local investigation; a failing source must not block the proposal."""
+        try:
+            return self._call_tool(name, arguments, incident_id)
+        except Exception as exc:
+            logger.warning("Tool %s failed for %s: %s", name, incident_id, exc)
+            return default
+
     def _generate_recommendation(self, root: str) -> tuple[str, str, Recommendation]:
         """Generate hypothesis, confidence, and recommendation based on root cause."""
         if root == "dependency:inventory":
@@ -175,10 +231,18 @@ class AgentInvestigator:
         return hypothesis, "medium", recommendation
 
     def _llm_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
-        """Perform investigation using OpenAI tool-calling."""
+        """
+        Perform investigation using OpenAI tool-calling.
+
+        Time, tool rounds and prompt size are all bounded; exceeding any of them
+        raises so the caller can fall back to the local investigation.
+        """
         from openai import OpenAI
 
-        client = OpenAI()
+        # The SDK default is a 10 minute timeout with 2 retries, which would pin the
+        # investigation thread (and the incident in "investigating") through an outage.
+        client = OpenAI(timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+        deadline = time.monotonic() + LLM_DEADLINE_SECONDS
         tools = self._tool_schemas()
         messages: list[dict[str, Any]] = [
             {
@@ -196,12 +260,20 @@ class AgentInvestigator:
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"incident": incident, "task": "Investigate and propose a bounded remediation."}
+                    {
+                        "incident": self._prompt_incident(incident),
+                        "task": "Investigate and propose a bounded remediation.",
+                    },
+                    default=str,
                 ),
             },
         ]
+        prompt_chars = sum(len(message["content"]) for message in messages)
 
-        for _ in range(6):
+        for _ in range(LLM_MAX_TOOL_ROUNDS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Agent exceeded its {LLM_DEADLINE_SECONDS:g}s time budget")
             # The message/tool payloads are built as plain dicts; the SDK accepts them
             # at runtime but its overloads require the typed param classes.
             response = client.chat.completions.create(  # type: ignore[call-overload]
@@ -209,19 +281,22 @@ class AgentInvestigator:
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
+                timeout=min(LLM_REQUEST_TIMEOUT_SECONDS, remaining),
             )
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
 
             if not tool_calls:
                 content = message.content or "{}"
-                parsed: dict[str, Any]
+                parsed: Any
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
                     parsed = json.loads(
                         content.replace("```json", "").replace("```", "").strip()
                     )
+                if not isinstance(parsed, dict):
+                    raise ValueError("Agent answer must be a JSON object")
                 parsed.setdefault("tools_used", [])
                 parsed.setdefault("generated_at", utc_now())
                 return parsed
@@ -234,14 +309,41 @@ class AgentInvestigator:
                 }
             )
 
-            for call in tool_calls:
-                arguments = json.loads(call.function.arguments or "{}")
-                result = self._call_tool(call.function.name, arguments, incident["id"])
-                messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)}
-                )
+            for index, call in enumerate(tool_calls):
+                if index >= LLM_MAX_TOOL_CALLS_PER_ROUND:
+                    result: Any = {"error": "Too many tool calls in one round; call skipped"}
+                else:
+                    result = self._run_llm_tool(call, incident["id"])
+                content = _clip(json.dumps(result, default=str), TOOL_RESULT_MAX_CHARS)
+                prompt_chars += len(content)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+            if prompt_chars > PROMPT_MAX_CHARS:
+                raise RuntimeError(f"Agent prompt exceeded {PROMPT_MAX_CHARS} characters")
 
         raise RuntimeError("Agent exceeded tool-call budget")
+
+    def _run_llm_tool(self, call: Any, incident_id: str) -> Any:
+        """Run one model-requested tool; failures go back to the model instead of aborting."""
+        try:
+            arguments = json.loads(call.function.arguments or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("Tool arguments must be a JSON object")
+            return self._call_tool(call.function.name, arguments, incident_id)
+        except Exception as exc:
+            logger.warning("LLM tool %s failed for %s: %s", call.function.name, incident_id, exc)
+            return {"error": _clip(f"{type(exc).__name__}: {exc}", 300)}
+
+    @staticmethod
+    def _prompt_incident(incident: dict[str, Any]) -> dict[str, Any]:
+        """Reduce an incident to what the model needs; evidence history can be large."""
+        data = incident.get("data") or {}
+        summary = {
+            key: incident.get(key)
+            for key in ("id", "title", "severity", "status", "root_cause_key", "first_seen")
+        }
+        summary["latest_evidence"] = data.get("latest_evidence")
+        summary["recent_evidence"] = list(data.get("evidence") or [])[-PROMPT_EVIDENCE_ITEMS:]
+        return summary
 
     def _call_tool(self, name: str, arguments: dict[str, Any], incident_id: str) -> Any:
         """Dispatch tool calls to the appropriate handler."""
@@ -269,9 +371,11 @@ class AgentInvestigator:
         path = Path(self.settings.runbook_dir) / (
             safe_slug if safe_slug.endswith(".md") else f"{safe_slug}.md"
         )
-        if not path.exists():
+        try:
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                return handle.read(RUNBOOK_MAX_CHARS)
+        except OSError:
             return "No matching runbook found. Treat this as ambiguous and do not broaden remediation."
-        return path.read_text(encoding="utf-8")
 
     @staticmethod
     def _runbook_slug(root: str) -> str:

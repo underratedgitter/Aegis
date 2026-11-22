@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -15,6 +15,7 @@ class IncidentStatus(StrEnum):
     INVESTIGATING = "investigating"
     RECOMMENDATION_PENDING = "recommendation_pending"
     APPROVED = "approved"
+    EXECUTING = "executing"
     RESOLVED = "resolved"
     CLOSED = "closed"
 
@@ -98,14 +99,22 @@ class IncidentEvent(BaseModel):
 # ─── API Requests ─────────────────────────────────────────────────────────────
 
 class ChaosRequest(BaseModel):
-    service: str = Field(pattern="^(checkout|inventory)$")
-    fault: str = Field(pattern="^(latency|errors|dependency|cpu)$")
+    model_config = ConfigDict(extra="forbid")
+
+    service: Literal["checkout", "inventory"]
+    fault: Literal["latency", "errors", "dependency", "cpu"]
     duration_seconds: float = Field(default=60, ge=1, le=900)
     intensity: float = Field(default=1, ge=0.1, le=10)
 
 
 class ApprovalRequest(BaseModel):
-    approver: str = Field(default="human-operator", min_length=2, max_length=80)
+    """Approver names are stored in events and the audit log and rendered in the UI, so keep them plain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approver: str = Field(
+        default="human-operator", min_length=2, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._@+-]*$"
+    )
 
 
 class FaultClearRequest(BaseModel):
@@ -121,6 +130,14 @@ class ScaleRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     service: str
+
+
+class ReadyResponse(BaseModel):
+    """Readiness: "ok", "degraded" (optional dependency down), or "unavailable" (HTTP 503)."""
+
+    status: str
+    service: str
+    checks: dict[str, str]
 
 
 class ServiceStatus(BaseModel):

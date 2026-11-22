@@ -31,6 +31,14 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_lockout_state():
+    """Failed attempts from one test must not lock out the next."""
+    control_plane._auth_failures.reset()
+    yield
+    control_plane._auth_failures.reset()
+
+
 @pytest.fixture
 def with_api_key(monkeypatch):
     """Configure a key the way AEGIS_API_KEY would at startup."""
@@ -132,3 +140,29 @@ class TestWebUiSendsKey:
     def test_key_is_kept_out_of_urls_and_persistent_storage(self):
         assert "localStorage" not in self.APP_JS
         assert "sessionStorage" in self.APP_JS
+
+
+class TestNonAsciiToken:
+    def test_non_ascii_bearer_token_is_rejected_with_401(self, client, with_api_key):
+        """compare_digest raises TypeError on non-ASCII str; that must not become a 500."""
+        response = client.get(
+            "/api/audit", headers={"Authorization": "Bearer caf\u00e9".encode("latin-1")}
+        )
+        assert response.status_code == 401
+
+
+class TestWebUiHandlesExecutingStatus:
+    """The UI has no JS test harness, so check the shipped assets statically."""
+
+    STATIC = Path(control_plane.__file__).parent / "static"
+
+    def test_status_filter_offers_executing(self):
+        assert '<option value="executing">' in (self.STATIC / "index.html").read_text()
+
+    def test_executing_status_is_styled(self):
+        assert ".status-executing" in (self.STATIC / "styles.css").read_text()
+
+    def test_action_buttons_are_only_offered_in_their_own_status(self):
+        app_js = (self.STATIC / "app.js").read_text()
+        assert 'incident.status === "recommendation_pending" ? `<button onclick="approveIncident' in app_js
+        assert 'const approved = incident.status === "approved"' in app_js
