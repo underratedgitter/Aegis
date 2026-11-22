@@ -9,14 +9,102 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from aegis.models import ExecutionState
+from aegis.models import ExecutionState, Severity
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterator
 
 BUSY_TIMEOUT_MS = 10_000
+# Events returned for an incident unless the caller asks for another page size.
+DEFAULT_EVENT_LIMIT = 100
 # Recent detected/signal events inspected when deciding whether another one is due.
 SIGNAL_LOOKBACK = 200
+
+# Ordered schema migrations. Entry N takes the database from user_version N-1 to N and holds
+# single SQL statements; each entry is applied in one transaction. Never edit a released
+# entry: append a new one.
+MIGRATIONS: tuple[tuple[str, ...], ...] = (
+    # 1: the original schema.
+    (
+        """CREATE TABLE IF NOT EXISTS incidents (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          status TEXT NOT NULL,
+          root_cause_key TEXT NOT NULL,
+          first_seen TEXT NOT NULL,
+          last_seen TEXT NOT NULL,
+          resolved_at TEXT,
+          data_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        """CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          incident_id TEXT NOT NULL,
+          at TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          message TEXT NOT NULL,
+          data_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        "CREATE INDEX IF NOT EXISTS events_incident_idx ON events(incident_id, id)",
+        """CREATE TABLE IF NOT EXISTS remediation_executions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          incident_id TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target TEXT NOT NULL,
+          parameters_json TEXT NOT NULL DEFAULT '{}',
+          approver TEXT NOT NULL,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        """CREATE INDEX IF NOT EXISTS remediation_incident_idx
+          ON remediation_executions(incident_id, id)""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
+          ON remediation_executions(target) WHERE state = 'in_flight'""",
+    ),
+    # 2: the audit log, previously an in-memory buffer lost on restart.
+    (
+        """CREATE TABLE audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          at TEXT NOT NULL,
+          action TEXT NOT NULL,
+          incident_id TEXT,
+          approver TEXT,
+          client_ip TEXT,
+          request_id TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        "CREATE INDEX audit_log_action_idx ON audit_log(action, id)",
+        "CREATE INDEX audit_log_incident_idx ON audit_log(incident_id, id)",
+    ),
+    # 3: incident listing and the engine's active-incident scan filter on status, newest first.
+    ("CREATE INDEX incidents_status_last_seen_idx ON incidents(status, last_seen)",),
+    # 4: /metrics counts events by kind on every scrape.
+    ("CREATE INDEX events_kind_idx ON events(kind)",),
+)
+
+
+CLOSED_STATUSES = ("resolved", "closed")
+# Open work first, finished incidents last, newest first within a status.
+_STATUS_ORDER = (
+    "ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'investigating' THEN 1 "
+    "WHEN 'recommendation_pending' THEN 2 WHEN 'approved' THEN 3 WHEN 'executing' THEN 3 "
+    "ELSE 4 END, last_seen DESC"
+)
+# What an incident list row needs from the stored data: the remediation's verification
+# state and the runbooks the investigation cited. The evidence history stays in the row.
+_SUMMARY_COLUMNS = (
+    "id, title, severity, status, root_cause_key, first_seen, last_seen, resolved_at, "
+    "json_extract(data_json, '$.remediation.verification.state') AS verification_state, "
+    "(SELECT json_group_array(DISTINCT json_extract(e.value, '$.label')) "
+    "FROM json_each(incidents.data_json, '$.investigation.evidence') AS e "
+    "WHERE json_extract(e.value, '$.source') = 'runbook') AS runbooks"
+)
+
+SEVERITY_RANK = {severity.value: rank for rank, severity in enumerate(Severity)}
 
 
 def utc_now() -> str:
@@ -38,8 +126,12 @@ class Store:
             path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000
         )
         self.db.row_factory = sqlite3.Row
-        self._configure()
-        self._initialize_schema()
+        try:
+            self._configure()
+            self._migrate()
+        except BaseException:
+            self.db.close()
+            raise
 
     def _configure(self) -> None:
         """Enable WAL so readers do not block the writer, and wait out brief lock contention.
@@ -56,51 +148,38 @@ class Store:
         with self.lock:
             self.db.execute("SELECT 1").fetchone()
 
-    def _initialize_schema(self) -> None:
-        """Create database tables if they don't exist."""
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS incidents (
-              id TEXT PRIMARY KEY,
-              title TEXT NOT NULL,
-              severity TEXT NOT NULL,
-              status TEXT NOT NULL,
-              root_cause_key TEXT NOT NULL,
-              first_seen TEXT NOT NULL,
-              last_seen TEXT NOT NULL,
-              resolved_at TEXT,
-              data_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE TABLE IF NOT EXISTS events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              incident_id TEXT NOT NULL,
-              at TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              message TEXT NOT NULL,
-              data_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS events_incident_idx ON events(incident_id, id);
-            CREATE TABLE IF NOT EXISTS remediation_executions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              idempotency_key TEXT NOT NULL UNIQUE,
-              incident_id TEXT NOT NULL,
-              action TEXT NOT NULL,
-              target TEXT NOT NULL,
-              parameters_json TEXT NOT NULL DEFAULT '{}',
-              approver TEXT NOT NULL,
-              state TEXT NOT NULL,
-              attempts INTEGER NOT NULL DEFAULT 0,
-              started_at TEXT NOT NULL,
-              finished_at TEXT,
-              detail_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS remediation_incident_idx
-              ON remediation_executions(incident_id, id);
-            CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
-              ON remediation_executions(target) WHERE state = 'in_flight';
-            """
-        )
-        self.db.commit()
+    def _schema_version(self) -> int:
+        return int(self.db.execute("PRAGMA user_version").fetchone()[0])
+
+    def _migrate(self) -> None:
+        """Bring the database up to the latest schema version, one transaction per migration.
+
+        The version lives in `PRAGMA user_version`. A database written before versioning
+        existed reads 0 and runs migration 1, whose statements are all `IF NOT EXISTS`.
+        """
+        latest = len(MIGRATIONS)
+        with self.lock:
+            current = self._schema_version()
+            if current > latest:
+                raise RuntimeError(
+                    f"database schema version {current} is newer than this build supports "
+                    f"({latest}); upgrade Aegis instead of opening it with an older release"
+                )
+            for version in range(current + 1, latest + 1):
+                self._apply_migration(version)
+
+    def _apply_migration(self, version: int) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Another process may have applied it while this one waited for the write lock.
+            if self._schema_version() < version:
+                for statement in MIGRATIONS[version - 1]:
+                    self.db.execute(statement)
+                self.db.execute(f"PRAGMA user_version = {version}")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def _row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         """Convert a database row to a dictionary."""
@@ -125,6 +204,103 @@ class Store:
                 (limit,),
             ).fetchall()
             return self._rows(rows)
+
+    def query_incidents(
+        self,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+        search: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One page of incident summaries and how many incidents match the filters.
+
+        `search` is a case-insensitive substring of the title or root-cause key. Rows
+        carry the summary fields only; `data` holds just the remediation verification
+        state and the runbooks cited, so listing does not read every incident's evidence
+        history. Use `get_incident` for the whole record.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if search:
+            escaped = search.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append(
+                "(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(root_cause_key) LIKE ? ESCAPE '\\')"
+            )
+            params.extend([f"%{escaped}%"] * 2)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) FROM incidents {where}", params
+            ).fetchone()[0]
+            rows = self.db.execute(
+                f"SELECT {_SUMMARY_COLUMNS} FROM incidents {where} {_STATUS_ORDER} LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._summary(row) for row in rows], total
+
+    @staticmethod
+    def _summary(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        state = result.pop("verification_state")
+        labels = json.loads(result.pop("runbooks") or "[]")
+        data: dict[str, Any] = {}
+        if state is not None:
+            data["remediation"] = {"verification": {"state": state}}
+        if labels:
+            data["investigation"] = {
+                "evidence": [{"source": "runbook", "label": label} for label in labels]
+            }
+        result["data"] = data
+        return result
+
+    def active_incidents(self) -> list[dict[str, Any]]:
+        """Every incident that is not resolved or closed, with no row limit."""
+        marks = ",".join("?" * len(CLOSED_STATUSES))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT * FROM incidents WHERE status NOT IN ({marks}) {_STATUS_ORDER}",
+                CLOSED_STATUSES,
+            ).fetchall()
+            return self._rows(rows)
+
+    def iter_incidents(self, batch_size: int = 200) -> Iterator[dict[str, Any]]:
+        """Every incident, oldest first, read in batches so an export never loads the table.
+
+        The store lock is held per batch, not across the iteration, so a slow consumer
+        does not block the engine.
+        """
+        last_rowid = 0
+        while True:
+            with self.lock:
+                rows = self.db.execute(
+                    "SELECT rowid AS _rowid, * FROM incidents WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch_size),
+                ).fetchall()
+                batch = self._rows(rows)
+            if not rows:
+                return
+            last_rowid = rows[-1]["_rowid"]
+            for incident in batch:
+                incident.pop("_rowid", None)
+                yield incident
+
+    def investigated_count(self) -> int:
+        """Number of incidents the agent has investigated."""
+        with self.lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM incidents "
+                    "WHERE json_type(data_json, '$.investigation') IS NOT NULL"
+                ).fetchone()[0]
+            )
 
     def get_incident(self, incident_id: str) -> dict[str, Any] | None:
         """Get a single incident by ID."""
@@ -170,10 +346,28 @@ class Store:
                     "latest_evidence": evidence,
                     "evidence": evidence_history[-self.max_evidence :],
                 }
+                # A higher-severity rule firing on the same root (latency, then checkout
+                # down) must not leave the incident understated; severity never goes down.
+                raised = SEVERITY_RANK.get(severity, -1) > SEVERITY_RANK.get(existing["severity"], -1)
                 self.db.execute(
-                    "UPDATE incidents SET last_seen = ?, data_json = ? WHERE id = ?",
-                    (now, json.dumps(merged), existing["id"]),
+                    "UPDATE incidents SET last_seen = ?, data_json = ?, severity = ?, title = ? "
+                    "WHERE id = ?",
+                    (
+                        now,
+                        json.dumps(merged),
+                        severity if raised else existing["severity"],
+                        title if raised else existing["title"],
+                        existing["id"],
+                    ),
                 )
+                if raised:
+                    self.add_event(
+                        existing["id"],
+                        "severity_raised",
+                        f"Severity raised from {existing['severity']} to {severity}: {title}",
+                        evidence,
+                        commit=False,
+                    )
                 if self._signal_event_due(existing["id"], evidence, now):
                     self.add_event(
                         existing["id"], "signal", f"Signal still active: {title}", evidence,
@@ -473,19 +667,132 @@ class Store:
             if commit:
                 self.db.commit()
 
-    def events(self, incident_id: str) -> list[dict[str, Any]]:
-        """Get all events for an incident, ordered by time."""
+    def events(
+        self,
+        incident_id: str,
+        limit: int = DEFAULT_EVENT_LIMIT,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """A page of an incident's events, oldest first: the latest `limit`.
+
+        Pass `before_id` (the first id of the page already held) to read the page before it.
+        """
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM events WHERE incident_id = ? ORDER BY id",
-                (incident_id,),
+                "SELECT * FROM events WHERE incident_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                (incident_id, before_id if before_id is not None else 1 << 62, limit),
             ).fetchall()
-            result = []
-            for row in rows:
-                item = dict(row)
-                item["data"] = json.loads(item.pop("data_json") or "{}")
-                result.append(item)
-            return result
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["data"] = json.loads(item.pop("data_json") or "{}")
+            result.append(item)
+        return result
+
+    def count_events(self, incident_id: str) -> int:
+        """Number of events recorded for an incident."""
+        with self.lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM events WHERE incident_id = ?", (incident_id,)
+                ).fetchone()[0]
+            )
+
+    def prune(self, *, older_than_days: int) -> dict[str, int]:
+        """Delete resolved or closed incidents finished more than `older_than_days` ago.
+
+        Their events and remediation executions go with them, in one transaction. Active
+        incidents are never touched, and neither is the audit log.
+
+        Returns:
+            How many incidents, events and executions were removed.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        marks = ",".join("?" * len(CLOSED_STATUSES))
+        old = (
+            f"SELECT id FROM incidents WHERE status IN ({marks}) "
+            "AND COALESCE(resolved_at, last_seen) < ?"
+        )
+        params = (*CLOSED_STATUSES, cutoff)
+        with self.lock:
+            try:
+                events = self.db.execute(
+                    f"DELETE FROM events WHERE incident_id IN ({old})", params
+                ).rowcount
+                executions = self.db.execute(
+                    f"DELETE FROM remediation_executions WHERE incident_id IN ({old})", params
+                ).rowcount
+                incidents = self.db.execute(
+                    f"DELETE FROM incidents WHERE id IN ({old})", params
+                ).rowcount
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+        return {"incidents": incidents, "events": events, "executions": executions}
+
+    def add_audit(
+        self,
+        action: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        client_ip: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Durably record who did what; `detail` is kept whole, and its incident and approver are indexed."""
+        detail = detail or {}
+        incident_id = detail.get("incident_id")
+        approver = detail.get("approver")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO audit_log(at,action,incident_id,approver,client_ip,request_id,detail_json)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    utc_now(),
+                    action,
+                    None if incident_id is None else str(incident_id),
+                    None if approver is None else str(approver),
+                    client_ip,
+                    request_id,
+                    json.dumps(detail, default=str),
+                ),
+            )
+            self.db.commit()
+
+    def audit_entries(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        action: str | None = None,
+        incident_id: str | None = None,
+        approver: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Audit entries, newest first, with the number that match the filters.
+
+        Each entry is the recorded detail plus `id`, `at`, `action` and, when known,
+        `client_ip` and `request_id`.
+        """
+        filters = {"action": action, "incident_id": incident_id, "approver": approver}
+        active = {column: value for column, value in filters.items() if value is not None}
+        where = " AND ".join(f"{column} = ?" for column in active) or "1"
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) FROM audit_log WHERE {where}", tuple(active.values())
+            ).fetchone()[0]
+            rows = self.db.execute(
+                f"SELECT * FROM audit_log WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*active.values(), limit, offset),
+            ).fetchall()
+        entries = []
+        for row in rows:
+            entry = json.loads(row["detail_json"] or "{}")
+            entry.update(id=row["id"], at=row["at"], action=row["action"])
+            for column in ("client_ip", "request_id"):
+                if row[column] is not None:
+                    entry[column] = row[column]
+            entries.append(entry)
+        return entries, total
 
     def incident_status_counts(self) -> dict[str, int]:
         """Number of incidents in each status."""

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import sqlite3
 import threading
 import time
-from collections import deque
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from statistics import mean
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,7 @@ from aegis.models import (
     MetricSnapshot,
     OverviewResponse,
     ReadyResponse,
+    ResolveRequest,
     Runbook,
     ServiceStatus,
     TelemetryStatus,
@@ -54,12 +56,12 @@ from aegis.models import (
 from aegis.remediation import RemediationError, RemediationExecutor, no_remediation_reason
 from aegis.selfmetrics import ControlPlaneCollector
 from aegis.settings import Settings
-from aegis.storage import Store, utc_now
+from aegis.storage import CLOSED_STATUSES, DEFAULT_EVENT_LIMIT, Store, utc_now
 from aegis.supervisor import EngineStatus, SupervisedEngine
 from aegis.telemetry import Telemetry
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 logger = configure_logging("aegis-control-plane")
 settings = Settings()
@@ -86,13 +88,33 @@ REGISTRY.register(ControlPlaneCollector(store, engine))
 
 # ─── Audit Log ────────────────────────────────────────────────────────────────
 
-AUDIT_LOG_MAX_ENTRIES = 1000
-_audit_log: deque[dict[str, Any]] = deque(maxlen=AUDIT_LOG_MAX_ENTRIES)
+# Who is calling, for audit entries written while a protected request is handled.
+_audit_origin: ContextVar[tuple[str | None, str | None]] = ContextVar(
+    "audit_origin", default=(None, None)
+)
+
+
+async def _bind_audit_origin(request: Request) -> None:
+    """Remember the caller's address and request ID for this request's audit entries.
+
+    Async on purpose: a sync dependency runs in a copied context, so what it set would
+    not reach the endpoint.
+    """
+    client_ip = request.client.host if request.client else None
+    _audit_origin.set((client_ip, getattr(request.state, "request_id", None)))
 
 
 def _audit(action: str, detail: dict[str, Any]) -> None:
-    """Record an audit event. The buffer is bounded; oldest entries are dropped."""
-    _audit_log.append({"action": action, "at": utc_now(), **detail})
+    """Durably record an audit event with the caller's address and request ID when known.
+
+    The action it records has already happened, so a database error is logged loudly
+    rather than turned into a failed response.
+    """
+    client_ip, request_id = _audit_origin.get()
+    try:
+        store.add_audit(action, detail, client_ip=client_ip, request_id=request_id)
+    except sqlite3.Error:
+        logger.exception("audit entry %s could not be written: %s", action, detail)
 
 
 remediation = RemediationExecutor(settings, store, telemetry=telemetry, audit=_audit)
@@ -184,7 +206,7 @@ def verify_api_key(request: Request) -> None:
 
 
 # Applied to every route that changes state or triggers an action.
-PROTECTED = [Depends(verify_api_key)]
+PROTECTED = [Depends(_bind_audit_origin), Depends(verify_api_key)]
 
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -329,15 +351,16 @@ def prometheus_metrics() -> Response:
 
 @app.get("/api/overview", response_model=OverviewResponse)
 def overview() -> OverviewResponse:
-    incidents = store.list_incidents()
+    recent, _ = store.query_incidents(limit=12)
+    counts = store.incident_status_counts()
+    total = sum(counts.values())
     durations = store.resolved_durations()
-    investigated = sum(bool(item["data"].get("investigation")) for item in incidents)
     return OverviewResponse(
-        incidents=incidents[:12],
-        open_incidents=sum(item["status"] not in {"resolved", "closed"} for item in incidents),
+        incidents=recent,
+        open_incidents=sum(n for status, n in counts.items() if status not in CLOSED_STATUSES),
         mttr_seconds=round(mean(durations), 2) if durations else None,
         resolved_incidents=len(durations),
-        agent_assisted_rate=round(investigated / len(incidents), 2) if incidents else None,
+        agent_assisted_rate=round(store.investigated_count() / total, 2) if total else None,
         slos=[telemetry.slo_snapshot().model_dump()],
         services=[_service_status("checkout", settings.checkout_url), _service_status("inventory", settings.inventory_url)],
         telemetry={"prometheus": _prometheus_status(), "loki": telemetry.loki_status()},
@@ -346,42 +369,30 @@ def overview() -> OverviewResponse:
 
 # ─── Incidents (list, export, and batch BEFORE /{id} routes) ──────────────────
 
+CSV_CHUNK_BYTES = 64 * 1024
+
 @app.get("/api/incidents")
 def list_incidents(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200), status: str | None = Query(None, max_length=64), severity: str | None = Query(None, max_length=64), search: str | None = Query(None, max_length=200)) -> dict[str, Any]:
-    all_incidents = store.list_incidents(limit=500)
-    if status:
-        all_incidents = [i for i in all_incidents if i["status"] == status]
-    if severity:
-        all_incidents = [i for i in all_incidents if i["severity"] == severity]
-    if search:
-        sl = search.lower()
-        all_incidents = [i for i in all_incidents if sl in i["title"].lower() or sl in i["root_cause_key"].lower()]
-    total = len(all_incidents)
-    start = (page - 1) * limit
-    return {"incidents": all_incidents[start:start + limit], "pagination": {"page": page, "limit": limit, "total": total, "pages": (total + limit - 1) // limit}}
+    """One page of incident summaries (no evidence history); GET /api/incidents/{id} has the rest."""
+    incidents, total = store.query_incidents(
+        status=status, severity=severity, search=search, offset=(page - 1) * limit, limit=limit
+    )
+    return {"incidents": incidents, "pagination": {"page": page, "limit": limit, "total": total, "pages": (total + limit - 1) // limit}}
 
 
 @app.get("/api/incidents/export")
 def export_incidents(
     export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
 ) -> Any:
-    incidents = store.list_incidents(limit=1000)
+    """Every incident, streamed in batches so a large history is never held in memory."""
     if export_format == "csv":
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "status", "root_cause_key", "first_seen", "last_seen", "resolved_at"])
-        writer.writeheader()
-        for inc in incidents:
-            writer.writerow({k: inc.get(k, "") for k in writer.fieldnames})
-        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=incidents.csv"})
-    return {"incidents": incidents, "exported_at": utc_now(), "count": len(incidents)}
+        return StreamingResponse(_incidents_csv(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=incidents.csv"})
+    return StreamingResponse(_incidents_json(), media_type="application/json")
 
 
 @app.post("/api/incidents/batch/approve", dependencies=PROTECTED)
 def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
-    # list_incidents sorts open/investigating first, so the default page of 50
-    # could hide pending recommendations behind a burst of new incidents.
-    incidents = store.list_incidents(limit=1000)
-    pending = [i for i in incidents if i["status"] == "recommendation_pending"]
+    pending = [i for i in store.active_incidents() if i["status"] == "recommendation_pending"]
     approved = []
     for inc in pending:
         rec = inc["data"].get("recommendation") or {}
@@ -402,11 +413,13 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
 
 
 @app.get("/api/incidents/{incident_id}")
-def get_incident(incident_id: str) -> dict[str, Any]:
-    incident = store.get_incident(incident_id)
-    if not incident:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    return {**incident, "events": store.events(incident_id)}
+def get_incident(
+    incident_id: str,
+    events_limit: int = Query(DEFAULT_EVENT_LIMIT, ge=1, le=1000),
+    events_before: int | None = Query(None, ge=1),
+) -> dict[str, Any]:
+    """The incident with its latest events (`events_limit`); `events_before` pages further back."""
+    return _incident_with_events(incident_id, events_limit, events_before)
 
 
 @app.post("/api/incidents/{incident_id}/investigate", response_model=InvestigateResponse, dependencies=PROTECTED)
@@ -418,6 +431,7 @@ def investigate(incident_id: str) -> InvestigateResponse:
         result = agent.investigate(incident_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit("investigate", {"incident_id": incident_id})
     return InvestigateResponse(
         incident_id=incident_id, investigation=Investigation.model_validate(result)
     )
@@ -445,7 +459,61 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
     store.add_event(incident_id, "approval", f"Human approval recorded from {request.approver}", approval)
     _audit("approve", {"incident_id": incident_id, "approver": request.approver})
-    return ApprovalResponse(**get_incident(incident_id))
+    return ApprovalResponse(**_incident_with_events(incident_id))
+
+
+# A remediation that is executing owns the incident until it finishes; every other
+# unfinished status can be closed by an operator, who is accountable for the call.
+MANUALLY_RESOLVABLE = frozenset(
+    {"open", "investigating", "recommendation_pending", "approved"}
+)
+
+
+@app.post("/api/incidents/{incident_id}/resolve", dependencies=PROTECTED)
+def resolve_incident(incident_id: str, request: ResolveRequest) -> dict[str, Any]:
+    """Close an incident by hand, e.g. one stuck awaiting approval after its fault went away."""
+    incident = store.get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    previous = incident["status"]
+    if previous in {"resolved", "closed"}:
+        raise HTTPException(status_code=409, detail="Incident is already resolved")
+    if previous not in MANUALLY_RESOLVABLE:
+        raise HTTPException(
+            status_code=409, detail="A remediation is executing; wait for it to finish"
+        )
+    resolved_at = utc_now()
+    resolution = {
+        "approver": request.approver,
+        "note": request.note,
+        "resolved_at": resolved_at,
+        "previous_status": previous,
+    }
+    # Atomic: an execution that started since the read above is not overridden.
+    if not store.merge_incident(
+        incident_id,
+        {"resolution": resolution},
+        status="resolved",
+        resolved_at=resolved_at,
+        only_if_status=MANUALLY_RESOLVABLE,
+    ):
+        raise HTTPException(status_code=409, detail="Incident changed state; reload and retry")
+    store.add_event(
+        incident_id,
+        "resolved",
+        f"Resolved manually by {request.approver}: {request.note}",
+        resolution,
+    )
+    _audit(
+        "incident_resolve",
+        {
+            "incident_id": incident_id,
+            "approver": request.approver,
+            "note": request.note,
+            "previous_status": previous,
+        },
+    )
+    return _incident_with_events(incident_id)
 
 
 @app.post("/api/incidents/{incident_id}/execute", response_model=ExecuteResponse, dependencies=PROTECTED)
@@ -462,8 +530,18 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
 # ─── Audit Log ────────────────────────────────────────────────────────────────
 
 @app.get("/api/audit", dependencies=PROTECTED)
-def audit_log(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
-    return {"entries": list(_audit_log)[-limit:][::-1], "total": len(_audit_log)}
+def audit_log(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    action: str | None = Query(None, max_length=64),
+    incident_id: str | None = Query(None, max_length=64),
+    approver: str | None = Query(None, max_length=80),
+) -> dict[str, Any]:
+    """Audit entries, newest first; `total` counts every entry that matches the filters."""
+    entries, total = store.audit_entries(
+        limit=limit, offset=offset, action=action, incident_id=incident_id, approver=approver
+    )
+    return {"entries": entries, "total": total, "limit": limit, "offset": offset}
 
 
 # ─── Chaos & Telemetry ────────────────────────────────────────────────────────
@@ -508,10 +586,50 @@ def runbooks() -> list[Runbook]:
 
 @app.post("/api/engine/run-once", dependencies=PROTECTED)
 def run_engine_once() -> dict[str, Any]:
-    return {"fired": engine.run_once()}
+    fired = engine.run_once()
+    _audit("engine_run_once", {"fired": len(fired)})
+    return {"fired": fired}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+CSV_COLUMNS = ["id", "title", "severity", "status", "root_cause_key", "first_seen", "last_seen", "resolved_at"]
+
+
+def _incidents_csv() -> Iterator[str]:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS)
+    writer.writeheader()
+    for incident in store.iter_incidents():
+        writer.writerow({column: incident.get(column) or "" for column in CSV_COLUMNS})
+        if buffer.tell() > CSV_CHUNK_BYTES:
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate()
+    yield buffer.getvalue()
+
+
+def _incidents_json() -> Iterator[str]:
+    count = 0
+    yield '{"incidents": ['
+    for incident in store.iter_incidents():
+        yield ("," if count else "") + json.dumps(incident)
+        count += 1
+    yield f'], "exported_at": {json.dumps(utc_now())}, "count": {count}}}'
+
+
+def _incident_with_events(
+    incident_id: str, events_limit: int = DEFAULT_EVENT_LIMIT, events_before: int | None = None
+) -> dict[str, Any]:
+    incident = store.get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {
+        **incident,
+        "events": store.events(incident_id, events_limit, events_before),
+        "events_total": store.count_events(incident_id),
+    }
+
 
 def _service_status(name: str, url: str) -> ServiceStatus:
     try:

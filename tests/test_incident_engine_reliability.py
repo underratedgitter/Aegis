@@ -73,6 +73,7 @@ def test_store_failures_are_contained_per_cycle(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "upsert_incident", locked)
     monkeypatch.setattr(store, "list_incidents", locked)
+    monkeypatch.setattr(store, "active_incidents", locked)
 
     assert engine.run_once() == []  # does not raise
 

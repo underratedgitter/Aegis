@@ -80,6 +80,7 @@ flowchart TB
 | `POST` | `/api/incidents/{incident_id}/investigate` | Trigger investigation | Yes |
 | `POST` | `/api/incidents/{incident_id}/approve` | Approve remediation | Yes |
 | `POST` | `/api/incidents/{incident_id}/execute` | Execute approved fix | Yes |
+| `POST` | `/api/incidents/{incident_id}/resolve` | Close an incident manually with a note | Yes |
 | `POST` | `/api/incidents/batch/approve` | Batch approve all | Yes |
 | `POST` | `/api/chaos` | Inject chaos fault | Yes (503 while no key is set) |
 | `GET` | `/api/metrics` | Metric snapshot | No |
