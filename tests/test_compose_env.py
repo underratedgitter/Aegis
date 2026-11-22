@@ -17,6 +17,10 @@ PASSTHROUGH = {
     "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", ("control", "checkout", "inventory")),
     "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", ("control", "checkout", "inventory")),
     "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", ("control",)),
+    "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", ("control",)),
+    "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", ("control",)),
+    "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", ("control",)),
+    "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", ("control",)),
 }
 
 

@@ -41,6 +41,7 @@ const state = {
   metrics: null,
   logs: null,
   ready: null,
+  engine: null,
   live: false,
   audit: null,
   runbooks: null,
@@ -387,8 +388,10 @@ function metricHtml(metric, {spark = false} = {}) {
 const metricsListHtml = (metrics, options) => `<div class="metric-list">${metrics.map((m) => metricHtml(m, options)).join("")}</div>`;
 
 // ── Overview ───────────────────────────────────────────────────────────────────
+// `ok` is true, false, or "warn" for a degraded but working component.
 function healthRow(name, ok, detail, status) {
-  return `<li class="health-row"><span class="dot ${ok ? "dot-ok" : "dot-bad"}" aria-hidden="true"></span><span>${esc(name)}<small>${esc(detail)}</small></span><span>${esc(status)}</span></li>`;
+  const tone = ok === "warn" ? "dot-warn" : ok ? "dot-ok" : "dot-bad";
+  return `<li class="health-row"><span class="dot ${tone}" aria-hidden="true"></span><span>${esc(name)}<small>${esc(detail)}</small></span><span>${esc(status)}</span></li>`;
 }
 
 function sloHtml(slo) {
@@ -816,7 +819,27 @@ function logUrl() {
 }
 
 function readyRows(ready) {
-  return Object.entries(ready.checks).map(([name, value]) => healthRow(name, value === "ok", name === "prometheus" || name === "loki" ? "telemetry backend" : "core component", value));
+  return Object.entries(ready.checks)
+    .filter(([name]) => name !== "engine_reason")
+    .map(([name, value]) => healthRow(name, value === "ok" ? true : value === "degraded" ? "warn" : false, name === "prometheus" || name === "loki" ? "telemetry backend" : "core component", value));
+}
+
+const ENGINE_TONES = {ok: true, degraded: "warn"};
+
+function engineRows(engine) {
+  const tone = ENGINE_TONES[engine.state] ?? false;
+  const age = engine.last_success_age_seconds;
+  const rows = [
+    healthRow("Engine loop", tone, engine.reason ?? `polls every ${engine.poll_seconds}s, cycle timeout ${engine.cycle_timeout_seconds}s`, engine.state),
+    healthRow("Last successful cycle", engine.last_success_at != null, engine.last_success_at ? fmtClock(engine.last_success_at) : "none yet", age == null ? "—" : `${Math.round(age)}s ago`),
+    healthRow("Consecutive failures", engine.consecutive_failures === 0, `${engine.failures_total} failed of ${engine.cycles_total} cycles`, String(engine.consecutive_failures)),
+    healthRow("Last error", !engine.consecutive_failures, engine.last_error_at ? fmtClock(engine.last_error_at) : "never", engine.last_error ?? "none"),
+  ];
+  for (const [name, breaker] of Object.entries(engine.breakers)) {
+    const wait = breaker.retry_in_seconds ? `, retry in ${Math.round(breaker.retry_in_seconds)}s` : "";
+    rows.push(healthRow(`${name} circuit`, breaker.state === "closed" ? true : breaker.state === "half_open" ? "warn" : false, `circuit breaker${wait}`, pretty(breaker.state)));
+  }
+  return rows;
 }
 
 function logRowHtml(entry) {
@@ -952,6 +975,7 @@ function renderRunOnce() {
 function renderSettings() {
   setDisabled("run-once", state.busy !== null);
   renderRunOnce();
+  setHtml("set-engine-status", state.engine ? `<ul class="health-list">${engineRows(state.engine).join("")}</ul>` : "");
   if (!state.ready) {
     setHtml("set-health", pendingHtml("settings", 4));
     return;
@@ -1044,14 +1068,48 @@ function applyRoute(initial) {
   refresh();
 }
 
+const ENGINE_PILLS = {
+  ok: ["engine online", "pill"],
+  degraded: ["engine degraded", "pill pill-warn"],
+  stalled: ["engine stalled", "pill pill-bad"],
+  stopped: ["engine stopped", "pill pill-bad"],
+};
+
+function renderEnginePill() {
+  let label = "connecting";
+  let className = "pill pill-muted";
+  let title = "";
+  if (state.connected === false) {
+    label = "disconnected";
+    className = "pill pill-bad";
+  } else if (state.connected) {
+    const engine = state.engine?.state;
+    [label, className] = ENGINE_PILLS[engine] ?? (engine ? [`engine ${engine}`, "pill pill-bad"] : ENGINE_PILLS.ok);
+    title = state.engine?.reason ?? "";
+  }
+  setText("engine-status", label);
+  setClass("engine-status", className);
+  if ($("engine-status").title !== title) $("engine-status").title = title;
+}
+
+// The page's own load decides connectivity; a failed engine read keeps the last known state.
+async function loadEngineStatus() {
+  try {
+    state.engine = await getJson("/api/engine/status");
+  } catch {
+    return;
+  }
+  renderEnginePill();
+}
+
 function setConnection(ok) {
-  setText("engine-status", ok ? "engine online" : "disconnected");
-  setClass("engine-status", ok ? "pill" : "pill pill-bad");
+  const previous = state.connected;
+  state.connected = ok;
+  renderEnginePill();
   const now = new Date().toLocaleTimeString([], {hour12: false});
   setText("last-updated", ok ? `Updated ${now}` : `Failed ${now}`);
-  if (state.connected === true && !ok) toast("Lost connection to the control plane.", "error");
-  if (state.connected === false && ok) toast("Connection restored.");
-  state.connected = ok;
+  if (previous === true && !ok) toast("Lost connection to the control plane.", "error");
+  if (previous === false && ok) toast("Connection restored.");
 }
 
 let inFlight = null;
@@ -1065,7 +1123,7 @@ function refresh({poll = false} = {}) {
   const name = state.route.name;
   inFlight = (async () => {
     try {
-      await VIEWS[name].load?.({poll});
+      await Promise.all([VIEWS[name].load?.({poll}), loadEngineStatus()]);
       setConnection(true);
     } catch (error) {
       state.errors[name] = error;
