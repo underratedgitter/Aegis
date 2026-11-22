@@ -52,7 +52,7 @@ def test_every_setting_names_its_environment_variable():
 
 
 def test_the_exclusion_and_shared_lists_name_real_settings():
-    assert (NOT_PASSED_THROUGH | SHARED) <= set(ENVIRONMENT)
+    assert set(ENVIRONMENT) >= (NOT_PASSED_THROUGH | SHARED)
 
 
 @pytest.fixture(autouse=True)
