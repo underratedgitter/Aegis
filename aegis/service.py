@@ -21,6 +21,7 @@ from aegis.http_security import (
     BodyLimitMiddleware,
     SecurityHeadersMiddleware,
     internal_error_response,
+    request_id,
 )
 from aegis.logging_utils import configure_logging
 from aegis.settings import Settings
@@ -261,13 +262,13 @@ async def metrics() -> Response:
 async def observe(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    rid = request_id(request.headers.get("x-request-id"))
     started = time.perf_counter()
     status = 500
     try:
         response = await call_next(request)
         status = response.status_code
-        response.headers["x-request-id"] = request_id
+        response.headers["x-request-id"] = rid
         return response
     finally:
         elapsed = time.perf_counter() - started
@@ -281,7 +282,7 @@ async def observe(
             "request_completed",
             extra={
                 "service": SERVICE,
-                "request_id": request_id,
+                "request_id": rid,
                 "route": route,
                 "status": status,
                 "duration_ms": round(elapsed * 1000, 2),

@@ -7,7 +7,6 @@ import io
 import sqlite3
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +31,7 @@ from aegis.http_security import (
     BodyLimitMiddleware,
     SecurityHeadersMiddleware,
     internal_error_response,
+    request_id,
 )
 from aegis.logging_utils import configure_logging
 from aegis.models import (
@@ -225,8 +225,8 @@ def _rate_limit_exempt(path: str) -> bool:
 async def request_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4())[:8])
-    request.state.request_id = request_id
+    rid = request_id(request.headers.get("X-Request-Id"))
+    request.state.request_id = rid
     client_ip = request.client.host if request.client else "unknown"
     try:
         if not _rate_limit_exempt(request.url.path):
@@ -234,9 +234,9 @@ async def request_middleware(
     except HTTPException as exc:
         # Middleware runs outside FastAPI's exception handlers, so a raised
         # HTTPException here surfaced as a 500 instead of the intended 429.
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"X-Request-Id": request_id})
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"X-Request-Id": rid})
     response = await call_next(request)
-    response.headers["X-Request-Id"] = request_id
+    response.headers["X-Request-Id"] = rid
     return response
 
 
