@@ -44,6 +44,7 @@ from aegis.models import (
     MetricSnapshot,
     OverviewResponse,
     ReadyResponse,
+    ResolveRequest,
     Runbook,
     ServiceStatus,
     TelemetryStatus,
@@ -400,10 +401,7 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
 
 @app.get("/api/incidents/{incident_id}")
 def get_incident(incident_id: str) -> dict[str, Any]:
-    incident = store.get_incident(incident_id)
-    if not incident:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    return {**incident, "events": store.events(incident_id)}
+    return _incident_with_events(incident_id)
 
 
 @app.post("/api/incidents/{incident_id}/investigate", response_model=InvestigateResponse, dependencies=PROTECTED)
@@ -444,6 +442,60 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
     store.add_event(incident_id, "approval", f"Human approval recorded from {request.approver}", approval)
     _audit("approve", {"incident_id": incident_id, "approver": request.approver})
     return ApprovalResponse(**get_incident(incident_id))
+
+
+# A remediation that is executing owns the incident until it finishes; every other
+# unfinished status can be closed by an operator, who is accountable for the call.
+MANUALLY_RESOLVABLE = frozenset(
+    {"open", "investigating", "recommendation_pending", "approved"}
+)
+
+
+@app.post("/api/incidents/{incident_id}/resolve", dependencies=PROTECTED)
+def resolve_incident(incident_id: str, request: ResolveRequest) -> dict[str, Any]:
+    """Close an incident by hand, e.g. one stuck awaiting approval after its fault went away."""
+    incident = store.get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    previous = incident["status"]
+    if previous in {"resolved", "closed"}:
+        raise HTTPException(status_code=409, detail="Incident is already resolved")
+    if previous not in MANUALLY_RESOLVABLE:
+        raise HTTPException(
+            status_code=409, detail="A remediation is executing; wait for it to finish"
+        )
+    resolved_at = utc_now()
+    resolution = {
+        "approver": request.approver,
+        "note": request.note,
+        "resolved_at": resolved_at,
+        "previous_status": previous,
+    }
+    # Atomic: an execution that started since the read above is not overridden.
+    if not store.merge_incident(
+        incident_id,
+        {"resolution": resolution},
+        status="resolved",
+        resolved_at=resolved_at,
+        only_if_status=MANUALLY_RESOLVABLE,
+    ):
+        raise HTTPException(status_code=409, detail="Incident changed state; reload and retry")
+    store.add_event(
+        incident_id,
+        "resolved",
+        f"Resolved manually by {request.approver}: {request.note}",
+        resolution,
+    )
+    _audit(
+        "incident_resolve",
+        {
+            "incident_id": incident_id,
+            "approver": request.approver,
+            "note": request.note,
+            "previous_status": previous,
+        },
+    )
+    return _incident_with_events(incident_id)
 
 
 @app.post("/api/incidents/{incident_id}/execute", response_model=ExecuteResponse, dependencies=PROTECTED)
@@ -522,6 +574,13 @@ def run_engine_once() -> dict[str, Any]:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _incident_with_events(incident_id: str) -> dict[str, Any]:
+    incident = store.get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {**incident, "events": store.events(incident_id)}
+
 
 def _service_status(name: str, url: str) -> ServiceStatus:
     try:

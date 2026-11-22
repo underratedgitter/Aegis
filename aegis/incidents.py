@@ -37,6 +37,11 @@ SHUTDOWN_JOIN_SECONDS = 15.0
 # How many incidents to scan for a recently resolved one to reopen.
 RECENT_INCIDENT_LOOKBACK = 1000
 
+# Statuses a quiet incident leaves on its own. A pending recommendation nobody approved
+# expires; approved and executing incidents are an operator's committed action and never
+# resolve underneath it, and investigating ones return to open or pending by themselves.
+AUTO_RESOLVABLE = frozenset({"open", "recommendation_pending"})
+
 # Fraction of the dependency threshold below which checkout symptoms stop being
 # attributed to an already-open dependency incident.
 ATTRIBUTION_RELEASE = 0.5
@@ -471,11 +476,12 @@ class IncidentEngine:
     ) -> None:
         """Resolve incidents that haven't fired for N cycles.
 
-        Auto-resolution only applies to incidents that are still ``open`` and
-        have not entered the investigation/approval pipeline. Missing signals
-        during ``investigating``, ``recommendation_pending``, or ``approved``
-        do not mean remediation finished; resolving there would close the
-        incident before the operator-approved action runs. An incident whose
+        Auto-resolution applies to ``open`` incidents and to ``recommendation_pending``
+        ones: with the signal gone nobody needs to approve the recommendation, so it
+        expires (a ``recommendation_expired`` event) instead of waiting forever.
+        Missing signals during ``investigating``, ``approved`` or ``executing`` do not
+        mean remediation finished; resolving there would close the incident before the
+        operator-approved action runs. An incident whose
         signal could not be read this cycle (``unverified_roots``) neither
         accumulates misses nor resolves, so a Prometheus outage cannot close it.
         """
@@ -506,7 +512,7 @@ class IncidentEngine:
                 self._misses.pop(incident_id, None)
                 continue
 
-            if incident["status"] != "open":
+            if incident["status"] not in AUTO_RESOLVABLE:
                 # Clear accumulated misses so a post-remediation incident gets
                 # a full resolution window after it returns to ``open``.
                 self._misses.pop(incident_id, None)
@@ -519,15 +525,26 @@ class IncidentEngine:
             # Re-check after the threshold: the status may have advanced since
             # the snapshot above (e.g. an investigation completing in another thread).
             incident = self.store.get_incident(incident_id)
-            if not incident or incident["status"] != "open":
+            if not incident or incident["status"] not in AUTO_RESOLVABLE:
                 self._misses.pop(incident_id, None)
                 continue
 
-            resolved_at = utc_now()
-            self.store.update_incident(incident_id, status="resolved", resolved_at=resolved_at)
-            self.store.add_event(
-                incident_id, "resolved", "Signals returned below the alert threshold"
-            )
+            status = incident["status"]
+            # Atomic: an approval that landed since the read above keeps the incident alive.
+            if self.store.merge_incident(
+                incident_id, status="resolved", resolved_at=utc_now(), only_if_status={status}
+            ):
+                if status == "open":
+                    self.store.add_event(
+                        incident_id, "resolved", "Signals returned below the alert threshold"
+                    )
+                else:
+                    self.store.add_event(
+                        incident_id,
+                        "recommendation_expired",
+                        "Signals returned below the alert threshold before the recommendation "
+                        "was approved; the recommendation expired",
+                    )
             self._misses.pop(incident_id, None)
 
     def _note_degraded(self, degraded: set[str]) -> None:

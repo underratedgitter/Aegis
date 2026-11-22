@@ -293,7 +293,9 @@ function openDialog(dialog) {
 }
 
 // rows: [label, value] pairs shown in the dialog; danger moves the default focus to Cancel.
-async function confirmDialog({title, message, rows = [], confirmLabel = "Confirm", variant = "", danger = false}) {
+// note: {label, placeholder} adds a required text field; the dialog then resolves to the typed
+// text (false when cancelled) instead of true.
+async function confirmDialog({title, message, rows = [], confirmLabel = "Confirm", variant = "", danger = false, note = null}) {
   setText("confirm-title", title);
   const body = $("confirm-body");
   body.replaceChildren();
@@ -313,12 +315,29 @@ async function confirmDialog({title, message, rows = [], confirmLabel = "Confirm
     }
     body.append(dl);
   }
+  let noteInput = null;
+  if (note) {
+    const label = document.createElement("label");
+    label.className = "field";
+    const caption = document.createElement("span");
+    caption.textContent = note.label;
+    noteInput = document.createElement("input");
+    noteInput.type = "text";
+    noteInput.required = true;
+    noteInput.minLength = 3;
+    noteInput.maxLength = 500;
+    noteInput.autocomplete = "off";
+    noteInput.placeholder = note.placeholder ?? "";
+    label.append(caption, noteInput);
+    body.append(label);
+  }
   const ok = $("confirm-ok");
   ok.textContent = confirmLabel;
   ok.className = `btn ${variant}`.trim();
   const result = openDialog($("confirm-dialog"));
-  (danger ? $("confirm-cancel") : ok).focus();
-  return (await result) === "confirm";
+  (noteInput ?? (danger ? $("confirm-cancel") : ok)).focus();
+  const confirmed = (await result) === "confirm";
+  return confirmed && noteInput ? noteInput.value.trim() : confirmed;
 }
 
 let keyPrompt = null;
@@ -606,10 +625,13 @@ function detailHtml(incident) {
   const pending = incident.status === "recommendation_pending";
   const approved = incident.status === "approved";
   const canInvestigate = !FINAL_STATUSES.has(incident.status) && incident.status !== "executing";
+  // An executing remediation owns the incident until it finishes.
+  const canResolve = canInvestigate;
   const buttons = [
     pending ? actionButton("approve", incident.id, "Approve remediation") : "",
     approved ? actionButton("execute", incident.id, "Execute fix", "btn-warn") : "",
     canInvestigate ? actionButton("investigate", incident.id, "Re-investigate", "btn-ghost") : "",
+    canResolve ? actionButton("resolve", incident.id, "Resolve", "btn-ghost") : "",
   ].join("");
   return `<div class="detail">
     <a class="back-link" href="#/incidents">${iconSvg("back")}All incidents</a>
@@ -713,6 +735,23 @@ async function executeIncident(id) {
     if (result.status === "dry_run") toast(`Dry run: ${result.action} on ${result.target} was validated and not sent. Nothing changed.`, "warn");
     else if (result.status === "already_executed") toast(`${result.action} on ${result.target} already ran for this approval; it was not repeated.`);
     else toast(`Executed ${result.action} on ${result.target}. Aegis will verify recovery.`);
+  });
+}
+
+async function resolveIncident(id) {
+  const incident = currentIncident(id);
+  const approver = getApprover();
+  const note = await confirmDialog({
+    title: "Resolve this incident?",
+    message: "Closes the incident without running any remediation. Use it when the problem is gone or was fixed outside Aegis; if the signal is still firing the incident reopens.",
+    rows: [["Incident", incident?.title ?? id], ["Status", incident ? pretty(incident.status) : "—"], ["Resolved by", approver]],
+    confirmLabel: "Resolve",
+    note: {label: "Note", placeholder: "Why is this being closed?"},
+  });
+  if (note === false) return;
+  await perform(`resolve:${id}`, async () => {
+    await post(`/api/incidents/${encodeURIComponent(id)}/resolve`, {approver, note});
+    toast("Incident resolved.");
   });
 }
 
@@ -943,7 +982,7 @@ async function loadRunbooks({poll}) {
 const KNOWN_AUDIT_ACTIONS = [
   "approve", "batch_approve", "execute", "execute_replayed", "execute_dry_run", "execute_failed",
   "execute_refused", "remediation_verified", "remediation_escalated", "chaos_inject", "investigate",
-  "engine_run_once",
+  "engine_run_once", "incident_resolve",
 ];
 
 function syncAuditActions(entries) {
@@ -1183,6 +1222,7 @@ const ACTIONS = {
   approve: ({id}) => approveIncident(id),
   execute: ({id}) => executeIncident(id),
   investigate: ({id}) => investigateIncident(id),
+  resolve: ({id}) => resolveIncident(id),
   "batch-approve": () => batchApprove(),
   export: ({format}) => exportIncidents(format),
   "run-once": () => runEngineOnce(),
