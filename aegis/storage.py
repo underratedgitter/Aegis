@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from aegis.models import ExecutionState
+from aegis.models import ExecutionState, Severity
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -79,6 +79,9 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX audit_log_incident_idx ON audit_log(incident_id, id)",
     ),
 )
+
+
+SEVERITY_RANK = {severity.value: rank for rank, severity in enumerate(Severity)}
 
 
 def utc_now() -> str:
@@ -219,10 +222,28 @@ class Store:
                     "latest_evidence": evidence,
                     "evidence": evidence_history[-self.max_evidence :],
                 }
+                # A higher-severity rule firing on the same root (latency, then checkout
+                # down) must not leave the incident understated; severity never goes down.
+                raised = SEVERITY_RANK.get(severity, -1) > SEVERITY_RANK.get(existing["severity"], -1)
                 self.db.execute(
-                    "UPDATE incidents SET last_seen = ?, data_json = ? WHERE id = ?",
-                    (now, json.dumps(merged), existing["id"]),
+                    "UPDATE incidents SET last_seen = ?, data_json = ?, severity = ?, title = ? "
+                    "WHERE id = ?",
+                    (
+                        now,
+                        json.dumps(merged),
+                        severity if raised else existing["severity"],
+                        title if raised else existing["title"],
+                        existing["id"],
+                    ),
                 )
+                if raised:
+                    self.add_event(
+                        existing["id"],
+                        "severity_raised",
+                        f"Severity raised from {existing['severity']} to {severity}: {title}",
+                        evidence,
+                        commit=False,
+                    )
                 if self._signal_event_due(existing["id"], evidence, now):
                     self.add_event(
                         existing["id"], "signal", f"Signal still active: {title}", evidence,
