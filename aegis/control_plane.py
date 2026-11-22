@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
+from aegis import __version__
 from aegis.agent import LLM_BREAKER_COOLDOWN_SECONDS, LLM_BREAKER_FAILURES, AgentInvestigator
 from aegis.auth import AuthFailureLimiter, bearer_header, presented_token, token_matches
 from aegis.breaker import CircuitBreaker
@@ -207,7 +208,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             store.close()
 
 
-app = FastAPI(title="Aegis SRE Copilot", version="0.3.0", lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(title="Aegis SRE Copilot", version=__version__, lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
