@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
@@ -244,11 +245,14 @@ def _install_hardening(application: FastAPI, cfg: Settings) -> None:
     Add the request/response guards; the last one added is the outermost.
 
     Security headers wrap everything, so CORS preflights and 413s carry them too.
+    The Host header is checked first of the guards: a page that DNS-rebinds its own
+    name to this address reaches the API with that name in Host, and is refused.
     CORS sits outside the body limit so browsers can read a 413. With no
     AEGIS_CORS_ORIGINS there is no CORS middleware and browsers keep their
     same-origin default. Aegis authenticates with a bearer token, not cookies,
     so credentials stay off.
     """
+    application.add_middleware(TrustedHostMiddleware, allowed_hosts=list(cfg.allowed_hosts))
     if cfg.cors_origins:
         application.add_middleware(
             CORSMiddleware,

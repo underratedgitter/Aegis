@@ -120,6 +120,53 @@ def _cors_app(origins: str) -> TestClient:
     return TestClient(application)
 
 
+def _host_client(application: FastAPI, hosts: str = "") -> TestClient:
+    control_plane._install_hardening(application, Settings(allowed_hosts_raw=hosts))
+    return TestClient(application)
+
+
+def _ping_app() -> FastAPI:
+    application = FastAPI()
+
+    @application.get("/ping")
+    def ping() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    return application
+
+
+class TestHostHeader:
+    """A DNS-rebinding page reaches the API under its own hostname; that Host must be refused."""
+
+    @pytest.mark.parametrize(
+        "host", ["localhost", "localhost:8000", "127.0.0.1:8000", "control:8000", "checkout:8000", "inventory"]
+    )
+    def test_local_and_compose_names_are_allowed_by_default(self, host):
+        assert _host_client(_ping_app()).get("/ping", headers={"Host": host}).status_code == 200
+
+    @pytest.mark.parametrize("host", ["evil.example", "evil.example:8000", "localhost.evil.example", "192.0.2.9"])
+    def test_other_hosts_are_refused(self, host):
+        response = _host_client(_ping_app()).get("/ping", headers={"Host": host})
+        assert response.status_code == 400
+        assert "ok" not in response.text
+
+    def test_configured_hosts_are_added_to_the_defaults(self):
+        client = _host_client(_ping_app(), "ops.example.com, *.internal.example")
+        assert client.get("/ping", headers={"Host": "ops.example.com"}).status_code == 200
+        assert client.get("/ping", headers={"Host": "a.internal.example:8443"}).status_code == 200
+        assert client.get("/ping", headers={"Host": "localhost"}).status_code == 200
+        assert client.get("/ping", headers={"Host": "evil.example"}).status_code == 400
+
+    def test_the_control_plane_refuses_unknown_hosts(self, client):
+        assert client.get("/api/incidents", headers={"Host": "evil.example"}).status_code == 400
+        assert client.get("/api/incidents", headers={"Host": "localhost:8000"}).status_code == 200
+
+    def test_the_demo_service_refuses_unknown_hosts(self):
+        svc = TestClient(service.app)
+        assert svc.get("/healthz", headers={"Host": "evil.example"}).status_code == 400
+        assert svc.get("/healthz", headers={"Host": "checkout:8000"}).status_code == 200
+
+
 class TestCors:
     def test_default_allows_no_cross_origin_reads(self, client):
         response = client.get("/healthz", headers={"Origin": "https://evil.example"})

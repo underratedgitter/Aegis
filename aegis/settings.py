@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,10 @@ REMEDIATION_TARGETS = frozenset({"checkout", "inventory"})
 DEFAULT_REMEDIATION_ALLOWED = ",".join(
     f"{target}:{action.value}" for target in sorted(REMEDIATION_TARGETS) for action in RemediationAction
 )
+# Host headers always accepted: local access, and the Compose service names that Prometheus,
+# the health checks and the services themselves use to reach each other.
+DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "control", "checkout", "inventory")
+_HOST_PATTERN = re.compile(r"(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -138,6 +143,7 @@ class Settings:
     auth_fail_max: int = _env_int("AEGIS_AUTH_FAIL_MAX", 10)
     max_body_bytes: int = _env_int("AEGIS_MAX_BODY_BYTES", 65536)
     cors_origins_raw: str = _env("AEGIS_CORS_ORIGINS", "")
+    allowed_hosts_raw: str = _env("AEGIS_ALLOWED_HOSTS", "")
 
     # Detection
     detection_cycles: int = _env_int("AEGIS_DETECTION_CYCLES", 2)
@@ -214,6 +220,12 @@ class Settings:
             problem = _origin_problem(origin)
             if problem:
                 problems.append(f"AEGIS_CORS_ORIGINS entry {origin!r} {problem}")
+        for host in self._extra_allowed_hosts:
+            if not _HOST_PATTERN.fullmatch(host):
+                problems.append(
+                    f"AEGIS_ALLOWED_HOSTS entry {host!r} must be a bare hostname such as "
+                    "ops.example.com or *.example.com (no scheme, port or path)"
+                )
         if problems:
             raise SettingsError(
                 "Invalid configuration:\n" + "\n".join(f"  - {item}" for item in problems)
@@ -250,6 +262,15 @@ class Settings:
     def cors_origins(self) -> tuple[str, ...]:
         """Browser origins allowed to call the API cross-origin; empty means same-origin only."""
         return tuple(item.strip().rstrip("/") for item in self.cors_origins_raw.split(",") if item.strip())
+
+    @property
+    def _extra_allowed_hosts(self) -> tuple[str, ...]:
+        return tuple(item.strip() for item in self.allowed_hosts_raw.split(",") if item.strip())
+
+    @property
+    def allowed_hosts(self) -> tuple[str, ...]:
+        """Host header values the API answers to: the defaults plus AEGIS_ALLOWED_HOSTS."""
+        return (*DEFAULT_ALLOWED_HOSTS, *self._extra_allowed_hosts)
 
     @property
     def remediation_allowed_actions(self) -> frozenset[tuple[str, str]]:

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
@@ -288,6 +289,7 @@ async def observe(
         )
 
 
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(_settings.allowed_hosts))
 app.add_middleware(SecurityHeadersMiddleware, csp=API_CSP)
 app.add_exception_handler(Exception, internal_error_response)
 

@@ -13,6 +13,7 @@ COMPOSE = yaml.safe_load((Path(__file__).resolve().parent.parent / "docker-compo
 # Variable -> (Settings attribute, services that read it)
 PASSTHROUGH = {
     "AEGIS_CORS_ORIGINS": ("cors_origins_raw", ("control", "checkout", "inventory")),
+    "AEGIS_ALLOWED_HOSTS": ("allowed_hosts_raw", ("control", "checkout", "inventory")),
     "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", ("control", "checkout", "inventory")),
     "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", ("control", "checkout", "inventory")),
     "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", ("control", "checkout", "inventory")),

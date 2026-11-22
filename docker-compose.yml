@@ -23,6 +23,7 @@ x-aegis-hardening: &aegis-hardening
 # Hardening settings read by every Aegis process; the defaults match aegis/settings.py.
 x-aegis-security-env: &aegis-security-env
   AEGIS_CORS_ORIGINS: ${AEGIS_CORS_ORIGINS:-}
+  AEGIS_ALLOWED_HOSTS: ${AEGIS_ALLOWED_HOSTS:-}
   AEGIS_AUTH_FAIL_MAX: ${AEGIS_AUTH_FAIL_MAX:-10}
   AEGIS_AUTH_FAIL_WINDOW: ${AEGIS_AUTH_FAIL_WINDOW:-60}
   AEGIS_MAX_BODY_BYTES: ${AEGIS_MAX_BODY_BYTES:-65536}
