@@ -1,4 +1,4 @@
-.PHONY: start up down logs backup test lint format typecheck chaos clean help
+.PHONY: start up down logs backup test lint format typecheck chaos e2e-reliability clean help
 
 # Default target
 help:
@@ -14,6 +14,7 @@ help:
 	@echo "  make format    - Format code"
 	@echo "  make typecheck - Run type checker"
 	@echo "  make chaos     - Inject chaos into inventory service"
+	@echo "  make e2e-reliability - Fault-injection proof on a separate Compose project (E2E_PROJECT, E2E_PORT_BASE)"
 	@echo "  make clean     - Remove temporary files"
 	@echo ""
 
@@ -54,6 +55,9 @@ typecheck:
 
 chaos:
 	python scripts/chaos.py --service inventory --fault dependency --duration 60
+
+e2e-reliability:
+	./scripts/e2e_reliability.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

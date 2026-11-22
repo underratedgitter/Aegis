@@ -22,7 +22,7 @@ from aegis.selfmetrics import BACKEND_ERRORS
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
 
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
@@ -208,7 +208,7 @@ class AgentInvestigator:
         ]
         evidence.append(Evidence(source="runbook", label=runbook_slug, detail=runbook[:280]))
 
-        hypothesis, confidence, recommendation = self._generate_recommendation(root)
+        hypothesis, confidence, recommendation = self._generate_recommendation(root, self._fired_rules(incident))
 
         return {
             "hypothesis": hypothesis,
@@ -238,7 +238,16 @@ class AgentInvestigator:
             logger.warning("Tool %s failed for %s: %s", name, incident_id, exc)
             return default
 
-    def _generate_recommendation(self, root: str) -> tuple[str, str, Recommendation]:
+    @staticmethod
+    def _fired_rules(incident: dict[str, Any]) -> set[str]:
+        """Names of the alert rules that have fired for the incident, from its evidence."""
+        data = incident["data"]
+        entries = [*data.get("evidence", []), data.get("latest_evidence")]
+        return {entry["rule"] for entry in entries if isinstance(entry, dict) and "rule" in entry}
+
+    def _generate_recommendation(
+        self, root: str, rules: Collection[str] = ()
+    ) -> tuple[str, str, Recommendation]:
         """Generate hypothesis, confidence, and recommendation based on root cause."""
         if root == "dependency:inventory":
             hypothesis = (
@@ -272,10 +281,13 @@ class AgentInvestigator:
             "Checkout is unhealthy; the available telemetry points to an application-level "
             "fault that needs confirmation before broader action."
         )
+        # Errors outrank latency; a latency-only incident must clear the latency fault,
+        # since clearing "errors" would leave it running and the fix could never verify.
+        fault = "errors" if "checkout_error_rate" in rules or "checkout_p95_latency" not in rules else "latency"
         recommendation = Recommendation(
             action=RemediationAction.CLEAR_FAULT,
             target="checkout",
-            parameters={"fault": "errors"},
+            parameters={"fault": fault},
             reason=(
                 "Clear the known demo fault only after an operator confirms the evidence."
             ),

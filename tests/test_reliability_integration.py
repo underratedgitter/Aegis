@@ -303,3 +303,26 @@ def test_the_executor_refuses_a_down_checkout_directly(tmp_path):
 
     with pytest.raises(RemediationError, match="not answering"):
         executor.execute("inc-1", "op")
+
+
+# The local investigator proposes the fault that actually fired -------------------------
+
+
+@pytest.mark.parametrize(
+    ("rules", "fault"),
+    [
+        (["checkout_p95_latency"], "latency"),
+        (["checkout_error_rate"], "errors"),
+        (["checkout_p95_latency", "checkout_error_rate"], "errors"),
+    ],
+)
+def test_the_local_recommendation_clears_the_fault_that_fired(tmp_path, monkeypatch, rules, fault):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    agent, store = advisory_agent(tmp_path, "service:checkout", rules[0])
+    for rule in rules[1:]:
+        store.upsert_incident("inc-1", "t", "high", "service:checkout", {"rule": rule})
+    store.transition_status("inc-1", "open", "investigating")
+
+    result = agent.investigate("inc-1")
+
+    assert result["recommendation"]["parameters"] == {"fault": fault}
