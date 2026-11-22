@@ -79,6 +79,7 @@ class TestFailFastValidation:
             "AEGIS_SIGNAL_EVENT_INTERVAL",
             "AEGIS_RATE_LIMIT_MAX",
             "AEGIS_RATE_LIMIT_WINDOW",
+            "AEGIS_RATE_LIMIT_MUTATION_MAX",
             "AEGIS_AUTH_FAIL_MAX",
             "AEGIS_AUTH_FAIL_WINDOW",
             "AEGIS_MAX_BODY_BYTES",

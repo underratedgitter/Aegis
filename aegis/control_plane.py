@@ -102,23 +102,35 @@ _rate_limits: dict[str, list[float]] = {}
 _rate_limit_lock = threading.Lock()
 RATE_LIMIT_WINDOW = settings.rate_limit_window
 RATE_LIMIT_MAX_REQUESTS = settings.rate_limit_max
+RATE_LIMIT_MUTATION_MAX_REQUESTS = settings.rate_limit_mutation_max
+# Health probes, scrapes and the static UI are cheap and polled by machines, so they are
+# not counted; they would otherwise eat the budget the operator's own clicks need.
+RATE_LIMIT_EXEMPT_PATHS = frozenset({"/", "/healthz", "/readyz", "/metrics"})
+RATE_LIMIT_EXEMPT_PREFIX = "/static/"
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-def _check_rate_limit(client_ip: str) -> None:
+def _check_rate_limit(client_ip: str, mutation: bool = False) -> None:
     """
-    Allow at most RATE_LIMIT_MAX_REQUESTS per client per window.
+    Allow at most RATE_LIMIT_MAX_REQUESTS reads or RATE_LIMIT_MUTATION_MAX_REQUESTS
+    mutations per client per window.
 
-    Buckets that fall empty are dropped so a long-running control plane does not
-    accumulate one list per source address it has ever seen.
+    Reads and mutations have separate budgets, so a few tabs polling the API cannot
+    lock an operator out of Approve and Execute. Buckets that fall empty are dropped
+    so a long-running control plane does not accumulate one list per source address
+    it has ever seen. The window is measured on the monotonic clock: a wall-clock
+    step must not unlock or lock out clients.
     """
-    now = time.time()
+    limit = RATE_LIMIT_MUTATION_MAX_REQUESTS if mutation else RATE_LIMIT_MAX_REQUESTS
+    bucket = f"mutation:{client_ip}" if mutation else client_ip
+    now = time.monotonic()
     with _rate_limit_lock:
-        recent = [t for t in _rate_limits.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW]
-        if len(recent) >= RATE_LIMIT_MAX_REQUESTS:
-            _rate_limits[client_ip] = recent
+        recent = [t for t in _rate_limits.get(bucket, []) if now - t < RATE_LIMIT_WINDOW]
+        if len(recent) >= limit:
+            _rate_limits[bucket] = recent
             raise HTTPException(status_code=429, detail="Rate limit exceeded.")
         recent.append(now)
-        _rate_limits[client_ip] = recent
+        _rate_limits[bucket] = recent
 
         # Evict clients that have gone quiet for a full window.
         if len(_rate_limits) > 1024:
@@ -204,6 +216,10 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
 
 
+def _rate_limit_exempt(path: str) -> bool:
+    return path in RATE_LIMIT_EXEMPT_PATHS or path.startswith(RATE_LIMIT_EXEMPT_PREFIX)
+
+
 @app.middleware("http")
 async def request_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -212,7 +228,8 @@ async def request_middleware(
     request.state.request_id = request_id
     client_ip = request.client.host if request.client else "unknown"
     try:
-        _check_rate_limit(client_ip)
+        if not _rate_limit_exempt(request.url.path):
+            _check_rate_limit(client_ip, mutation=request.method not in READ_METHODS)
     except HTTPException as exc:
         # Middleware runs outside FastAPI's exception handlers, so a raised
         # HTTPException here surfaced as a 500 instead of the intended 429.

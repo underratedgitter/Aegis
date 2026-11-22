@@ -60,7 +60,7 @@ class TestSecurityHeaders:
 
     def test_rate_limit_responses_are_hardened(self, client, monkeypatch):
         monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 0)
-        response = client.get("/healthz")
+        response = client.get("/api/incidents")
         assert response.status_code == 429
         assert_hardened(response)
 

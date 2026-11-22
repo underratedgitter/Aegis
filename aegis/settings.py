@@ -133,6 +133,7 @@ class Settings:
     api_key: str = _env("AEGIS_API_KEY", "")
     rate_limit_window: int = _env_int("AEGIS_RATE_LIMIT_WINDOW", 60)
     rate_limit_max: int = _env_int("AEGIS_RATE_LIMIT_MAX", 100)
+    rate_limit_mutation_max: int = _env_int("AEGIS_RATE_LIMIT_MUTATION_MAX", 30)
     auth_fail_window: int = _env_int("AEGIS_AUTH_FAIL_WINDOW", 60)
     auth_fail_max: int = _env_int("AEGIS_AUTH_FAIL_MAX", 10)
     max_body_bytes: int = _env_int("AEGIS_MAX_BODY_BYTES", 65536)
@@ -173,6 +174,7 @@ class Settings:
             "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", 0),
             "AEGIS_RATE_LIMIT_WINDOW": ("rate_limit_window", 1),
             "AEGIS_RATE_LIMIT_MAX": ("rate_limit_max", 1),
+            "AEGIS_RATE_LIMIT_MUTATION_MAX": ("rate_limit_mutation_max", 1),
             "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", 1),
             "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", 1),
             "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", 1),
