@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from aegis.breaker import CircuitBreaker
 from aegis.models import (
     Evidence,
     Investigation,
@@ -17,6 +18,7 @@ from aegis.models import (
     RemediationAction,
 )
 from aegis.remediation import RemediationExecutor
+from aegis.selfmetrics import BACKEND_ERRORS
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
@@ -34,6 +36,10 @@ LLM_MAX_RETRIES = 1
 LLM_DEADLINE_SECONDS = 60.0
 LLM_MAX_TOOL_ROUNDS = 6
 LLM_MAX_TOOL_CALLS_PER_ROUND = 8
+# After this many consecutive failures the model is skipped (local investigation only) for
+# the cooldown, so a dead or rate-limited API does not cost a full timeout per incident.
+LLM_BREAKER_FAILURES = 3
+LLM_BREAKER_COOLDOWN_SECONDS = 60.0
 PROMPT_MAX_CHARS = 60_000
 PROMPT_EVIDENCE_ITEMS = 5
 TOOL_RESULT_MAX_CHARS = 8_000
@@ -55,10 +61,19 @@ def _clip(text: str, limit: int) -> str:
 class AgentInvestigator:
     """Evidence-first investigator with an optional OpenAI tool-calling loop."""
 
-    def __init__(self, settings: Settings, store: Store, telemetry: Telemetry):
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        telemetry: Telemetry,
+        llm_breaker: CircuitBreaker | None = None,
+    ):
         self.settings = settings
         self.store = store
         self.telemetry = telemetry
+        self.llm_breaker = llm_breaker or CircuitBreaker(
+            "llm", LLM_BREAKER_FAILURES, LLM_BREAKER_COOLDOWN_SECONDS
+        )
 
     def investigate(self, incident_id: str) -> dict[str, Any]:
         """
@@ -80,7 +95,7 @@ class AgentInvestigator:
         result: dict[str, Any]
         if os.getenv("OPENAI_API_KEY"):
             try:
-                result = self._llm_investigation(incident)
+                result = self._guarded_llm_investigation(incident)
                 result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
                 # Reject malformed LLM output before it is stored or proposed for approval.
                 Investigation.model_validate(result)
@@ -115,6 +130,19 @@ class AgentInvestigator:
             f"Investigation complete ({result['mode']}): {result['hypothesis']}",
             {"citations": result.get("evidence", []), "mode": result["mode"]},
         )
+        return result
+
+    def _guarded_llm_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
+        """Call the model unless its circuit breaker is open; report the outcome to the breaker."""
+        if not self.llm_breaker.allow():
+            raise RuntimeError("LLM circuit open: recent calls failed, using local investigation")
+        try:
+            result = self._llm_investigation(incident)
+        except Exception as exc:
+            BACKEND_ERRORS.labels("llm").inc()
+            self.llm_breaker.record_failure(f"{type(exc).__name__}: {exc}")
+            raise
+        self.llm_breaker.record_success()
         return result
 
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:

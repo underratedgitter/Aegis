@@ -48,6 +48,7 @@ h1:focus { outline:none; }
 .pill { display:inline-block; min-width:112px; padding:3px 10px; text-align:center; font-size:11px; border-radius:20px; border:1px solid #285c5a; color:var(--accent); }
 .pill-muted { color:var(--muted); border-color:var(--line-2); }
 .pill-bad { color:var(--red); border-color:#7a3340; }
+.pill-warn { color:var(--amber); border-color:#6b552a; }
 
 /* ── Controls ──────────────────────────────────────────────────────────── */
 .btn { display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:8px 14px; border:1px solid transparent; border-radius:9px; background:var(--accent); color:var(--accent-ink); font:inherit; font-weight:700; text-decoration:none; cursor:pointer; white-space:nowrap; }

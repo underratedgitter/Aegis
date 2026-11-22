@@ -20,6 +20,10 @@ PASSTHROUGH = {
     "AEGIS_DETECTION_CYCLES": ("detection_cycles", ("control",)),
     "AEGIS_BLIND_SECONDS": ("blind_seconds", ("control",)),
     "AEGIS_REOPEN_COOLDOWN_SECONDS": ("reopen_cooldown_seconds", ("control",)),
+    "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", ("control",)),
+    "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", ("control",)),
+    "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", ("control",)),
+    "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", ("control",)),
 }
 
 

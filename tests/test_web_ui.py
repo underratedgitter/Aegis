@@ -79,3 +79,21 @@ class TestEveryEndpointIsReachable:
                 if piece and piece not in APP_JS:
                     missing.append((route.path, piece))
         assert not missing
+
+
+class TestEngineHealthDisplay:
+    def test_pill_shows_every_engine_state_and_the_reason(self):
+        for state in ("degraded", "stalled", "stopped"):
+            assert f"engine {state}" in APP_JS, state
+        assert 'id="engine-status"' in INDEX
+        assert ".pill-warn" in CSS
+        assert "state.engine?.reason" in APP_JS
+
+    def test_settings_view_has_an_engine_health_panel_patched_in_place(self):
+        assert 'id="set-engine-status"' in INDEX
+        assert 'setHtml("set-engine-status"' in APP_JS
+        assert "circuit" in APP_JS
+
+    def test_a_failed_engine_read_never_marks_the_control_plane_disconnected(self):
+        body = APP_JS.split("async function loadEngineStatus()")[1].split("\n}\n")[0]
+        assert "setConnection" not in body

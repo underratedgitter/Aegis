@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 MAX_PORT = 65535
+# The engine's stop() waits grace + 5 s; with uvicorn's 10 s drain that must fit Compose's 30 s.
+MAX_SHUTDOWN_GRACE_SECONDS = 15
 
 
 class SettingsError(ValueError):
@@ -91,6 +93,12 @@ class Settings:
     max_evidence_history: int = _env_int("AEGIS_MAX_EVIDENCE", 100)
     resolution_cycles: int = _env_int("AEGIS_RESOLUTION_CYCLES", 2)
     signal_event_interval: int = _env_int("AEGIS_SIGNAL_EVENT_INTERVAL", 60)
+    # Supervision: a cycle longer than the timeout is abandoned and counted as a failure;
+    # no success for stale_intervals polls (plus one cycle timeout) marks the engine stalled.
+    cycle_timeout_seconds: int = _env_int("AEGIS_CYCLE_TIMEOUT_SECONDS", 60)
+    engine_stale_intervals: int = _env_int("AEGIS_ENGINE_STALE_INTERVALS", 3)
+    engine_max_backoff_seconds: int = _env_int("AEGIS_ENGINE_MAX_BACKOFF_SECONDS", 60)
+    shutdown_grace_seconds: int = _env_int("AEGIS_SHUTDOWN_GRACE_SECONDS", 10)
 
     # LLM
     openai_model: str = _env("OPENAI_MODEL", "gpt-4.1-mini")
@@ -121,6 +129,10 @@ class Settings:
             "AEGIS_MAX_EVIDENCE": ("max_evidence_history", 1),
             "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", 1),
             "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", 0),
+            "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", 1),
+            "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", 1),
+            "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", 1),
+            "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", 0),
             "AEGIS_RATE_LIMIT_WINDOW": ("rate_limit_window", 1),
             "AEGIS_RATE_LIMIT_MAX": ("rate_limit_max", 1),
             "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", 1),
@@ -138,6 +150,10 @@ class Settings:
                 problems.append(f"{env_name} must be at least {minimum}, got {value}")
             elif attr == "port" and value > MAX_PORT:
                 problems.append(f"{env_name} must be at most {MAX_PORT}, got {value}")
+            elif attr == "shutdown_grace_seconds" and value > MAX_SHUTDOWN_GRACE_SECONDS:
+                problems.append(
+                    f"{env_name} must be at most {MAX_SHUTDOWN_GRACE_SECONDS}, got {value}"
+                )
         for origin in self.cors_origins:
             problem = _origin_problem(origin)
             if problem:

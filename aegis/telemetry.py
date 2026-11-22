@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from aegis.breaker import CircuitBreaker
 from aegis.models import MetricSnapshot, SLOSnapshot, TelemetryStatus
 from aegis.queries import CHECKOUT_ERRORS_30M, CHECKOUT_REQUESTS_30M, SNAPSHOT_QUERIES
+from aegis.selfmetrics import BACKEND_ERRORS
 
 if TYPE_CHECKING:
     from aegis.settings import Settings
@@ -27,8 +29,9 @@ QUERY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 0.25
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 
-# After a query exhausts its retries, further queries fail fast for this long instead of
-# each spending the full retry budget on a server that is down.
+# After a query exhausts its retries (or Loki fails a readiness check), further calls fail
+# fast for this long instead of each spending the full timeout on a backend that is down.
+BREAKER_FAILURES = 1
 BREAKER_COOLDOWN_SECONDS = 10.0
 
 
@@ -45,7 +48,10 @@ class Telemetry:
                 keepalive_expiry=30,
             ),
         )
-        self._breaker_open_until = 0.0
+        self.prometheus_breaker = CircuitBreaker(
+            "prometheus", BREAKER_FAILURES, BREAKER_COOLDOWN_SECONDS
+        )
+        self.loki_breaker = CircuitBreaker("loki", BREAKER_FAILURES, BREAKER_COOLDOWN_SECONDS)
 
     def _get_once(self, url: str, params: dict[str, str]) -> httpx.Response:
         response = self._client.get(url, params=params)
@@ -65,7 +71,7 @@ class Telemetry:
 
     def prometheus_query(self, query: str) -> dict[str, Any]:
         """Execute a PromQL query against Prometheus."""
-        if time.monotonic() < self._breaker_open_until:
+        if not self.prometheus_breaker.allow():
             return {
                 "query": query,
                 "value": None,
@@ -76,7 +82,7 @@ class Telemetry:
             response = self._get_with_retry(
                 f"{self.settings.prometheus_url.rstrip('/')}/api/v1/query", {"query": query}
             )
-            self._breaker_open_until = 0.0
+            self.prometheus_breaker.record_success()
             payload = response.json()
             if payload.get("status") != "success":
                 return {
@@ -94,10 +100,15 @@ class Telemetry:
                     value = None
             return {"query": query, "value": value, "series": result, "source": "prometheus"}
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            if self._is_outage(exc):
-                self._breaker_open_until = time.monotonic() + BREAKER_COOLDOWN_SECONDS
+            BACKEND_ERRORS.labels("prometheus").inc()
+            if self._is_outage(exc) or isinstance(exc, httpx.InvalidURL):
+                self.prometheus_breaker.record_failure(str(exc))
+            else:
+                # A 4xx for a bad query still proves the server is answering.
+                self.prometheus_breaker.record_success()
             return {"query": query, "value": None, "error": f"HTTP error: {exc}", "source": "prometheus"}
         except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+            BACKEND_ERRORS.labels("prometheus").inc()
             return {"query": query, "value": None, "error": f"Parse error: {exc}", "source": "prometheus"}
 
     @staticmethod
@@ -187,17 +198,28 @@ class Telemetry:
 
     def loki_status(self) -> TelemetryStatus:
         """Check if Loki is available and ready."""
+        if not self.loki_breaker.allow():
+            return TelemetryStatus(
+                available=False, error="Loki unavailable: recent checks failed, retrying shortly"
+            )
         try:
             response = self._client.get(
                 f"{self.settings.loki_url.rstrip('/')}/ready",
                 timeout=httpx.Timeout(LOKI_TIMEOUT_SECONDS),
             )
-            return TelemetryStatus(
-                available=response.is_success,
-                status_code=response.status_code,
-            )
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            BACKEND_ERRORS.labels("loki").inc()
+            self.loki_breaker.record_failure(str(exc))
             return TelemetryStatus(available=False, error=str(exc))
+        if response.status_code >= 500:
+            BACKEND_ERRORS.labels("loki").inc()
+            self.loki_breaker.record_failure(f"HTTP {response.status_code}")
+        else:
+            self.loki_breaker.record_success()
+        return TelemetryStatus(
+            available=response.is_success,
+            status_code=response.status_code,
+        )
 
     def close(self) -> None:
         """Close the HTTP client."""
