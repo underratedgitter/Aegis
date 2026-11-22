@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import httpx
 
 from aegis.auth import bearer_header
+from aegis.errors import error_summary
 from aegis.models import (
     BLIND_ROOT,
     LIVENESS_RULE,
@@ -353,7 +354,8 @@ class RemediationExecutor:
                 response.raise_for_status()
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 outcome = self._failure_outcome(exc)
-                sent.errors.append({"attempt": attempt, "error": str(exc), "outcome": outcome})
+                logger.warning("Remediation request to %s failed (attempt %d): %s", url, attempt, exc)
+                sent.errors.append({"attempt": attempt, "error": error_summary(exc), "outcome": outcome})
                 sent.maybe_applied = sent.maybe_applied or MAY_HAVE_APPLIED in outcome
                 if not self._retryable(exc) or attempt == self.settings.remediation_max_attempts:
                     break

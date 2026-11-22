@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,10 @@ REMEDIATION_TARGETS = frozenset({"checkout", "inventory"})
 DEFAULT_REMEDIATION_ALLOWED = ",".join(
     f"{target}:{action.value}" for target in sorted(REMEDIATION_TARGETS) for action in RemediationAction
 )
+# Host headers always accepted: local access, and the Compose service names that Prometheus,
+# the health checks and the services themselves use to reach each other.
+DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "control", "checkout", "inventory")
+_HOST_PATTERN = re.compile(r"(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -28,7 +33,7 @@ class SettingsError(ValueError):
 
 def _env(name: str, default: str) -> Any:
     """Read an environment variable when a Settings instance is built, not at import time."""
-    return field(default_factory=lambda: os.getenv(name, default))
+    return field(default_factory=lambda: os.getenv(name, default), metadata={"env": name})
 
 
 def _env_int(name: str, default: int) -> Any:
@@ -49,7 +54,7 @@ def _env_int(name: str, default: int) -> Any:
         except ValueError:
             return raw
 
-    return field(default_factory=parse)
+    return field(default_factory=parse, metadata={"env": name})
 
 
 def _env_bool(name: str, default: bool) -> Any:
@@ -66,7 +71,7 @@ def _env_bool(name: str, default: bool) -> Any:
             return False
         return raw
 
-    return field(default_factory=parse)
+    return field(default_factory=parse, metadata={"env": name})
 
 
 def _origin_problem(origin: str) -> str | None:
@@ -119,6 +124,8 @@ class Settings:
     max_evidence_history: int = _env_int("AEGIS_MAX_EVIDENCE", 100)
     resolution_cycles: int = _env_int("AEGIS_RESOLUTION_CYCLES", 2)
     signal_event_interval: int = _env_int("AEGIS_SIGNAL_EVENT_INTERVAL", 60)
+    # Resolved incidents (with their events and executions) older than this many days are pruned; 0 keeps all.
+    retention_days: int = _env_int("AEGIS_RETENTION_DAYS", 30)
     # Supervision: a cycle longer than the timeout is abandoned and counted as a failure;
     # no success for stale_intervals polls (plus one cycle timeout) marks the engine stalled.
     cycle_timeout_seconds: int = _env_int("AEGIS_CYCLE_TIMEOUT_SECONDS", 60)
@@ -133,10 +140,12 @@ class Settings:
     api_key: str = _env("AEGIS_API_KEY", "")
     rate_limit_window: int = _env_int("AEGIS_RATE_LIMIT_WINDOW", 60)
     rate_limit_max: int = _env_int("AEGIS_RATE_LIMIT_MAX", 100)
+    rate_limit_mutation_max: int = _env_int("AEGIS_RATE_LIMIT_MUTATION_MAX", 30)
     auth_fail_window: int = _env_int("AEGIS_AUTH_FAIL_WINDOW", 60)
     auth_fail_max: int = _env_int("AEGIS_AUTH_FAIL_MAX", 10)
     max_body_bytes: int = _env_int("AEGIS_MAX_BODY_BYTES", 65536)
     cors_origins_raw: str = _env("AEGIS_CORS_ORIGINS", "")
+    allowed_hosts_raw: str = _env("AEGIS_ALLOWED_HOSTS", "")
 
     # Detection
     detection_cycles: int = _env_int("AEGIS_DETECTION_CYCLES", 2)
@@ -167,12 +176,14 @@ class Settings:
             "AEGIS_MAX_EVIDENCE": ("max_evidence_history", 1),
             "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", 1),
             "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", 0),
+            "AEGIS_RETENTION_DAYS": ("retention_days", 0),
             "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", 1),
             "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", 1),
             "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", 1),
             "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", 0),
             "AEGIS_RATE_LIMIT_WINDOW": ("rate_limit_window", 1),
             "AEGIS_RATE_LIMIT_MAX": ("rate_limit_max", 1),
+            "AEGIS_RATE_LIMIT_MUTATION_MAX": ("rate_limit_mutation_max", 1),
             "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", 1),
             "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", 1),
             "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", 1),
@@ -212,6 +223,12 @@ class Settings:
             problem = _origin_problem(origin)
             if problem:
                 problems.append(f"AEGIS_CORS_ORIGINS entry {origin!r} {problem}")
+        for host in self._extra_allowed_hosts:
+            if not _HOST_PATTERN.fullmatch(host):
+                problems.append(
+                    f"AEGIS_ALLOWED_HOSTS entry {host!r} must be a bare hostname such as "
+                    "ops.example.com or *.example.com (no scheme, port or path)"
+                )
         if problems:
             raise SettingsError(
                 "Invalid configuration:\n" + "\n".join(f"  - {item}" for item in problems)
@@ -248,6 +265,15 @@ class Settings:
     def cors_origins(self) -> tuple[str, ...]:
         """Browser origins allowed to call the API cross-origin; empty means same-origin only."""
         return tuple(item.strip().rstrip("/") for item in self.cors_origins_raw.split(",") if item.strip())
+
+    @property
+    def _extra_allowed_hosts(self) -> tuple[str, ...]:
+        return tuple(item.strip() for item in self.allowed_hosts_raw.split(",") if item.strip())
+
+    @property
+    def allowed_hosts(self) -> tuple[str, ...]:
+        """Host header values the API answers to: the defaults plus AEGIS_ALLOWED_HOSTS."""
+        return (*DEFAULT_ALLOWED_HOSTS, *self._extra_allowed_hosts)
 
     @property
     def remediation_allowed_actions(self) -> frozenset[tuple[str, str]]:

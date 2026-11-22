@@ -1,4 +1,4 @@
-.PHONY: start up down logs backup test lint format typecheck chaos e2e-reliability clean help
+.PHONY: start up down logs backup test test-cov lint format typecheck chaos e2e-reliability clean help
 
 # Default target
 help:
@@ -10,6 +10,7 @@ help:
 	@echo "  make logs      - View logs for control, checkout, and inventory"
 	@echo "  make backup    - Save a consistent copy of the incident database to ./backups"
 	@echo "  make test      - Run tests"
+	@echo "  make test-cov  - Run tests with a coverage report (terminal and htmlcov/)"
 	@echo "  make lint      - Run linter"
 	@echo "  make format    - Format code"
 	@echo "  make typecheck - Run type checker"
@@ -62,5 +63,5 @@ e2e-reliability:
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
-	rm -rf .pytest_cache .ruff_cache mypy_cache htmlcov .coverage
+	rm -rf .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage
 	rm -rf dist build *.egg-info

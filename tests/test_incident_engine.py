@@ -108,9 +108,7 @@ def test_open_incident_resolves_after_the_configured_misses(tmp_path):
     assert store.get_incident(incident["id"])["status"] == "resolved"
 
 
-@pytest.mark.parametrize(
-    "status", ["investigating", "recommendation_pending", "approved"]
-)
+@pytest.mark.parametrize("status", ["investigating", "approved", "executing"])
 def test_incidents_in_the_remediation_pipeline_do_not_auto_resolve(tmp_path, status):
     engine, store, incident = _engine_with_incident(tmp_path)
     store.update_incident(incident["id"], status=status)

@@ -59,24 +59,45 @@ class TestEventDurability:
         assert "detected" in kinds
 
 
-class TestAuditLogIsBounded:
+class TestRateLimitBudgets:
     @pytest.fixture(autouse=True)
-    def _restore(self):
-        saved = list(control_plane._audit_log)
-        control_plane._audit_log.clear()
+    def _fresh(self, monkeypatch):
+        control_plane._rate_limits.clear()
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_WINDOW", 60)
         yield
-        control_plane._audit_log.clear()
-        control_plane._audit_log.extend(saved)
+        control_plane._rate_limits.clear()
 
-    def test_oldest_entries_are_dropped(self):
-        limit = control_plane.AUDIT_LOG_MAX_ENTRIES
-        for i in range(limit + 250):
-            control_plane._audit("test", {"n": i})
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
 
-        assert len(control_plane._audit_log) == limit
-        # The most recent entry is retained, the earliest is gone.
-        assert control_plane._audit_log[-1]["n"] == limit + 249
-        assert control_plane._audit_log[0]["n"] == 250
+        return TestClient(control_plane.app, raise_server_exceptions=False)
+
+    @pytest.mark.parametrize("path", ["/", "/healthz", "/readyz", "/metrics", "/static/app.js"])
+    def test_probes_scrapes_and_static_files_are_never_limited(self, client, monkeypatch, path):
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 1)
+        codes = {client.get(path).status_code for _ in range(5)}
+        assert 429 not in codes
+
+    def test_api_reads_are_still_limited(self, client, monkeypatch):
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
+        codes = [client.get("/api/incidents").status_code for _ in range(3)]
+        assert codes == [200, 200, 429]
+
+    def test_polling_cannot_starve_mutations(self, client, monkeypatch):
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MUTATION_MAX_REQUESTS", 2)
+        for _ in range(3):
+            client.get("/api/incidents")
+        assert client.get("/api/incidents").status_code == 429
+        assert client.post("/api/engine/run-once").status_code == 200
+
+    def test_mutations_have_their_own_limit_and_do_not_use_up_reads(self, client, monkeypatch):
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MUTATION_MAX_REQUESTS", 1)
+        codes = [client.post("/api/engine/run-once").status_code for _ in range(2)]
+        assert codes == [200, 429]
+        assert client.get("/api/incidents").status_code == 200
 
 
 class TestRateLimiterIsBounded:
@@ -118,8 +139,21 @@ class TestRateLimiterIsBounded:
         monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)
         monkeypatch.setattr(control_plane, "RATE_LIMIT_WINDOW", 60)
         client = TestClient(control_plane.app, raise_server_exceptions=False)
-        codes = [client.get("/healthz").status_code for _ in range(3)]
+        codes = [client.get("/api/incidents").status_code for _ in range(3)]
         assert codes == [200, 200, 429]
+
+    def test_the_window_uses_the_monotonic_clock(self, monkeypatch):
+        """A wall-clock step (NTP, manual change) must neither unlock nor lock out a client."""
+        now = {"t": 1000.0}
+        monkeypatch.setattr(control_plane.time, "monotonic", lambda: now["t"])
+        monkeypatch.setattr(control_plane.time, "time", lambda: 0.0)
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 1)
+        monkeypatch.setattr(control_plane, "RATE_LIMIT_WINDOW", 60)
+        control_plane._check_rate_limit("192.0.2.4")
+        with pytest.raises(control_plane.HTTPException):
+            control_plane._check_rate_limit("192.0.2.4")
+        now["t"] += 61
+        control_plane._check_rate_limit("192.0.2.4")
 
     def test_the_window_rolls_forward(self, monkeypatch):
         monkeypatch.setattr(control_plane, "RATE_LIMIT_MAX_REQUESTS", 2)

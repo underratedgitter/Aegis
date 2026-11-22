@@ -24,6 +24,19 @@ def test_metrics_endpoint_is_scrapeable_without_a_redirect():
     assert b"aegis_http_requests_total" in response.body
 
 
+def test_metric_labels_use_the_route_template_not_the_raw_path():
+    client = TestClient(app)
+
+    client.get("/scanner/probe-aaa")
+    client.get("/scanner/probe-bbb")
+    client.get("/api/checkout")
+    body = client.get("/metrics").text
+
+    assert "probe-" not in body
+    assert 'route="unmatched"' in body
+    assert 'route="/api/checkout"' in body
+
+
 def test_service_chaos_inputs_are_bounded():
     with pytest.raises(ValidationError):
         FaultRequest(fault="dependency", duration_seconds=901)

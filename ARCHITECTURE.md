@@ -17,18 +17,18 @@ flowchart TB
     end
 
     subgraph Storage["💾 Storage"]
-        SQLite[("SQLite<br/>incidents.db")]
+        SQLite[("SQLite<br/>aegis.db")]
         Runbooks["Runbooks<br/>*.md files"]
         Logs["JSONL Logs<br/>checkout.jsonl<br/>inventory.jsonl"]
     end
 
     subgraph DemoServices["🎪 Demo Services"]
-        Checkout["Checkout Service<br/>:8080"]
-        Inventory["Inventory Service<br/>:8081"]
+        Checkout["Checkout Service<br/>host :8080"]
+        Inventory["Inventory Service<br/>host :8081"]
     end
 
     subgraph Observability["📊 Observability Stack"]
-        Prometheus["Prometheus<br/>:9090"]
+        Prometheus["Prometheus<br/>:9090 (host :9091)"]
         Grafana["Grafana<br/>:3001"]
         Loki["Loki<br/>:3100"]
         Promtail["Promtail<br/>Log Shipper"]
@@ -69,21 +69,27 @@ flowchart TB
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
 | `GET` | `/` | Web dashboard | No |
-| `GET` | `/healthz` | Health check | No |
+| `GET` | `/healthz` | Liveness | No |
+| `GET` | `/readyz` | Readiness: database, engine, Prometheus, Loki | No |
+| `GET` | `/metrics` | The control plane's own Prometheus metrics | No |
+| `GET` | `/api/engine/status` | Engine heartbeat and backend circuit breakers | No |
 | `GET` | `/api/overview` | Dashboard overview | No |
 | `GET` | `/api/incidents` | List incidents (paginated) | No |
 | `GET` | `/api/incidents/export` | Export as JSON/CSV | No |
-| `GET` | `/api/incidents/{id}` | Get incident detail | No |
-| `POST` | `/api/incidents/{id}/investigate` | Trigger investigation | No |
-| `POST` | `/api/incidents/{id}/approve` | Approve remediation | No |
-| `POST` | `/api/incidents/{id}/execute` | Execute approved fix | No |
-| `POST` | `/api/incidents/batch/approve` | Batch approve all | No |
-| `POST` | `/api/chaos` | Inject chaos fault | No |
-| `GET` | `/api/metrics` | Prometheus metrics | No |
+| `GET` | `/api/incidents/{incident_id}` | Get incident detail | No |
+| `POST` | `/api/incidents/{incident_id}/investigate` | Trigger investigation | Yes |
+| `POST` | `/api/incidents/{incident_id}/approve` | Approve remediation | Yes |
+| `POST` | `/api/incidents/{incident_id}/execute` | Execute approved fix | Yes |
+| `POST` | `/api/incidents/{incident_id}/resolve` | Close an incident manually with a note | Yes |
+| `POST` | `/api/incidents/batch/approve` | Batch approve all | Yes |
+| `POST` | `/api/chaos` | Inject chaos fault | Yes (503 while no key is set) |
+| `GET` | `/api/metrics` | Metric snapshot | No |
 | `GET` | `/api/logs` | Recent logs | No |
 | `GET` | `/api/runbooks` | List runbooks | No |
-| `GET` | `/api/audit` | Audit log | No |
-| `POST` | `/api/engine/run-once` | Force engine cycle | No |
+| `GET` | `/api/audit` | Audit log | Yes |
+| `POST` | `/api/engine/run-once` | Force engine cycle | Yes |
+
+"Yes" means `Authorization: Bearer $AEGIS_API_KEY` is required whenever `AEGIS_API_KEY` is set. With no key the demo runs open (and logs a security warning), except fault injection, which stays disabled. Every request must also carry an allowed `Host` header (`AEGIS_ALLOWED_HOSTS`).
 
 ## 🔄 Incident Lifecycle
 
@@ -123,7 +129,11 @@ stateDiagram-v2
 | **Input Validation** | Pydantic models with regex patterns for fault types |
 | **Remediation Safety** | Allowlist-based actions, no shell/Docker access |
 | **Thread Safety** | `threading.RLock()` on all SQLite operations |
-| **Request IDs** | UUID-based tracking for debugging |
+| **Request IDs** | UUID-based tracking for debugging; a client-supplied `X-Request-Id` is kept only if it is 1-64 plain characters |
+| **DNS rebinding** | The `Host` header must be `localhost`, `127.0.0.1`, a Compose service name or listed in `AEGIS_ALLOWED_HOSTS` |
+| **Browser hardening** | CSP, `X-Frame-Options`, `nosniff` and `Referrer-Policy` on every response; HSTS over HTTPS |
+| **Error text** | Clients get the error class and HTTP status; detail (with URL credentials removed) stays in the server log |
+| **LLM input** | Logs, metrics and runbooks are marked untrusted in the prompt; the metrics tool takes named queries only and the logs tool returns selected, truncated fields |
 
 ### ⚠️ Risks & Mitigations
 
@@ -131,24 +141,22 @@ stateDiagram-v2
 |------|----------|------------|
 | **Demo services' `/admin/*` require an API key** | Mitigated | `AEGIS_API_KEY` is required; Compose publishes all ports on `127.0.0.1` by default |
 | **Grafana anonymous admin** | Fixed | Anonymous access is disabled and Grafana binds to loopback by default |
-| **CORS allows `*`** | Low (demo) | Credentials are disabled, so cookies are never sent cross-origin; restrict origins for production |
-| **In-memory rate limiting** | Low (single instance) | Use Redis for multi-instance deployments |
+| **CORS** | Mitigated | Off by default (same-origin only); `AEGIS_CORS_ORIGINS` lists explicit origins, wildcards are rejected and credentials are never allowed |
+| **In-memory rate limiting** | Low (single instance) | Separate read and mutation budgets per client address; use a shared store for multi-instance deployments |
 | **No HTTPS enforcement** | Low | Handle at reverse proxy (nginx/traefik) |
-| **No request body size limit** | Medium | Add `app.add_middleware(BaseHTTPMiddleware, max_body_size=1_000_000)` |
+| **Request body size** | Mitigated | Bodies over `AEGIS_MAX_BODY_BYTES` (default 65536) get `413` |
 | **SQLite not encrypted** | Low (demo) | Use SQLCipher for production |
-| **No CSP headers** | Low | Add `Content-Security-Policy` header |
 | **OpenAI API key in env** | Low | Use secret manager (Vault, AWS SSM) |
-| **No audit persistence** | Medium | Persist `_audit_log` to SQLite |
-| **No log rotation** | Low | Use `logging.handlers.RotatingFileHandler` |
+| **Audit log is in memory** | Medium | The last 1000 entries are kept and lost on restart; persist them to SQLite for compliance |
+| **Log rotation** | Mitigated | Service JSONL logs rotate at 10 MB (3 backups); Docker rotates container logs |
 
 ### 🛡️ Security Recommendations
 
-1. **Keep the API key set** — `make start` generates `AEGIS_API_KEY` in `.env`; set it explicitly for direct `docker compose` runs. The control room UI does not send the header, so drive authenticated mutations directly
-2. **Restrict CORS** — Set `CORS_ORIGINS=https://your-domain.com`
-3. **Add request body limits** — Prevent large payload attacks
+1. **Keep the API key set** — `make start` generates `AEGIS_API_KEY` in `.env`; set it explicitly for direct `docker compose` runs. Enter the key in the control room's Settings view (kept in the tab's session storage and sent as a bearer token), or send the header from scripts
+2. **Restrict CORS** — Leave `AEGIS_CORS_ORIGINS` empty, or list only the origins you trust
+3. **Set the allowed hosts** — Add the name you reach Aegis by to `AEGIS_ALLOWED_HOSTS`
 4. **Persist audit log** — Store in SQLite for compliance
-5. **Add CSP headers** — Prevent XSS in the dashboard
-6. **Use HTTPS** — Deploy behind a TLS-terminating proxy
+5. **Use HTTPS** — Deploy behind a TLS-terminating proxy
 
 ## 📊 Data Flow
 
@@ -161,9 +169,9 @@ Control plane → POST /admin/faults → Checkout/Inventory
         ↓
 Fault state updated in memory
         ↓
-Prometheus scrapes /metrics every 15s
+Prometheus scrapes /metrics every 5s
         ↓
-Alert rule fires (error rate > 15%)
+Engine rule fires (checkout error rate > 15% for AEGIS_DETECTION_CYCLES cycles)
         ↓
 Incident Engine detects → Creates incident in SQLite
         ↓
@@ -195,17 +203,17 @@ Status: resolved (after 2 healthy cycles)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Docker Network: monitoring                │
+│                Docker Compose default network                │
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
 │  │ Control  │  │ Checkout │  │ Inventory│  │Prometheus│  │
 │  │ Plane    │──│ Service  │  │ Service  │  │          │  │
-│  │ :8000    │  │ :8080    │  │ :8081    │  │ :9090    │  │
+│  │ :8000    │  │ :8000    │  │ :8000    │  │ :9090    │  │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
 │       │                                        │          │
 │       │            ┌──────────┐  ┌──────────┐  │          │
 │       │            │  Grafana │  │  Loki    │  │          │
-│       │            │  :3001   │──│  :3100   │  │          │
+│       │            │  :3000   │──│  :3100   │  │          │
 │       │            └──────────┘  └──────────┘  │          │
 │       │                        ┌──────────┐    │          │
 │       │                        │ Promtail │────┘          │
@@ -218,7 +226,7 @@ Status: resolved (after 2 healthy cycles)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `aegis_http_requests_total` | Counter | service, method, route, status | HTTP requests |
+| `aegis_http_requests_total` | Counter | service, method, route, status | HTTP requests; `route` is the route template, or `unmatched` |
 | `aegis_http_request_duration_seconds` | Histogram | service, method, route | Request latency |
 | `aegis_dependency_requests_total` | Counter | service, dependency, status | Dependency calls |
 | `aegis_dependency_errors_total` | Counter | service, dependency, reason | Dependency errors |
@@ -228,17 +236,14 @@ Status: resolved (after 2 healthy cycles)
 
 ## 🔔 Alert Rules
 
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| `AppDown` | Prometheus can't reach `/metrics` | critical |
-| `HighErrorRate` | > 5% requests return 5xx | critical |
-| `HighClientErrorRate` | > 10% requests return 4xx | warning |
-| `HighLatencyP99` | P99 latency > 1s | warning |
-| `HighHeapUsage` | Heap > 85% | warning |
-| `HighMemoryRSS` | RSS > 200MB | warning |
-| `HighEventLoopLag` | Event loop lag > 100ms | warning |
-| `LowRequestRate` | < 0.01 req/s for 10min | info |
+The incident engine evaluates these in-process with the queries in `aegis/queries.py`; there are no Prometheus alerting rules. HTTP rules count only `/api/*` routes, so scrapes and health probes do not dilute them.
 
----
+| Rule | Condition | Severity |
+|------|-----------|----------|
+| `checkout_error_rate` | Checkout 5xx share of API requests > 15% (2 m rate) | high |
+| `checkout_p95_latency` | Checkout p95 API latency > 0.75 s | medium |
+| `inventory_dependency_errors` | Checkout's inventory dependency errors > 0.05/s | high |
+| `checkout_cpu_burn` | Synthetic CPU stress active on checkout | medium |
+| `checkout_down` | A checkout target fails its Prometheus scrape | high |
 
-*Generated for Aegis v0.3.0*
+A rule must breach for `AEGIS_DETECTION_CYCLES` consecutive cycles before an incident opens. A signal that stays unreadable for `AEGIS_BLIND_SECONDS` opens one `telemetry:blind` incident.

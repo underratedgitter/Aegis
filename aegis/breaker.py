@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from aegis.errors import redact_urls
+
 BreakerState = Literal["closed", "open", "half_open"]
 ERROR_MAX_CHARS = 300
 
@@ -69,7 +71,7 @@ class CircuitBreaker:
     def record_failure(self, error: str) -> None:
         with self._lock:
             self._failures += 1
-            self._last_error = error[:ERROR_MAX_CHARS]
+            self._last_error = redact_urls(error)[:ERROR_MAX_CHARS]
             self._probing = False
             if self._failures >= self._threshold:
                 self._opened_at = time.monotonic()

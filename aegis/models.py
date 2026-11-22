@@ -143,6 +143,12 @@ class ApprovalRequest(BaseModel):
     )
 
 
+class ResolveRequest(ApprovalRequest):
+    """Closing an incident by hand records who did it and why."""
+
+    note: str = Field(min_length=3, max_length=500)
+
+
 class FaultClearRequest(BaseModel):
     fault: str | None = Field(default=None, pattern="^(latency|errors|dependency|cpu)$")
 

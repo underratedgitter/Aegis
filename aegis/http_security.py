@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import uuid
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -53,6 +55,21 @@ DOCS_CSP = "; ".join(
 
 # JSON-only services never render markup, so nothing may load at all.
 API_CSP = "default-src 'none'; frame-ancestors 'none'"
+
+
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def request_id(client_value: str | None) -> str:
+    """
+    Use the caller's X-Request-Id only when it is short and plain, else make a new one.
+
+    The id is written to logs, and the investigator reads those logs, so free text from
+    a client must not get through.
+    """
+    if client_value and _REQUEST_ID.fullmatch(client_value):
+        return client_value
+    return str(uuid.uuid4())
 
 
 def security_headers(policy: str, https: bool) -> dict[str, str]:

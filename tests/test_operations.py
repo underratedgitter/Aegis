@@ -291,7 +291,10 @@ def test_sigterm_shuts_the_process_down_cleanly(tmp_path, module):
             proc.kill()
             proc.wait()
 
-    stderr = proc.stderr.read() if proc.stderr else ""
+    stderr = ""
+    if proc.stderr:
+        stderr = proc.stderr.read()
+        proc.stderr.close()
     assert proc.returncode in (0, -signal.SIGTERM), stderr
     assert "Traceback" not in stderr
     if module == "aegis.control_main":

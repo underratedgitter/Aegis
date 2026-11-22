@@ -23,6 +23,7 @@ x-aegis-hardening: &aegis-hardening
 # Hardening settings read by every Aegis process; the defaults match aegis/settings.py.
 x-aegis-security-env: &aegis-security-env
   AEGIS_CORS_ORIGINS: ${AEGIS_CORS_ORIGINS:-}
+  AEGIS_ALLOWED_HOSTS: ${AEGIS_ALLOWED_HOSTS:-}
   AEGIS_AUTH_FAIL_MAX: ${AEGIS_AUTH_FAIL_MAX:-10}
   AEGIS_AUTH_FAIL_WINDOW: ${AEGIS_AUTH_FAIL_WINDOW:-60}
   AEGIS_MAX_BODY_BYTES: ${AEGIS_MAX_BODY_BYTES:-65536}
@@ -34,8 +35,13 @@ services:
     environment:
       <<: *aegis-security-env
       AEGIS_POLL_SECONDS: ${AEGIS_POLL_SECONDS:-5}
+      AEGIS_MAX_EVIDENCE: ${AEGIS_MAX_EVIDENCE:-100}
+      AEGIS_RATE_LIMIT_MAX: ${AEGIS_RATE_LIMIT_MAX:-100}
+      AEGIS_RATE_LIMIT_MUTATION_MAX: ${AEGIS_RATE_LIMIT_MUTATION_MAX:-30}
+      AEGIS_RATE_LIMIT_WINDOW: ${AEGIS_RATE_LIMIT_WINDOW:-60}
       AEGIS_RESOLUTION_CYCLES: ${AEGIS_RESOLUTION_CYCLES:-2}
       AEGIS_SIGNAL_EVENT_INTERVAL: ${AEGIS_SIGNAL_EVENT_INTERVAL:-60}
+      AEGIS_RETENTION_DAYS: ${AEGIS_RETENTION_DAYS:-30}
       AEGIS_DETECTION_CYCLES: ${AEGIS_DETECTION_CYCLES:-2}
       AEGIS_BLIND_SECONDS: ${AEGIS_BLIND_SECONDS:-300}
       AEGIS_REOPEN_COOLDOWN_SECONDS: ${AEGIS_REOPEN_COOLDOWN_SECONDS:-300}
@@ -151,7 +157,6 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=2d
-      - --web.enable-lifecycle
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -196,6 +201,7 @@ services:
     volumes:
       - ./observability/promtail.yml:/etc/promtail/config.yml:ro
       - aegis-logs:/var/log/aegis:ro
+      - promtail-data:/promtail
     depends_on:
       loki:
         condition: service_healthy
@@ -242,4 +248,5 @@ volumes:
   aegis-data:
   aegis-logs:
   prometheus-data:
+  promtail-data:
   grafana-data:

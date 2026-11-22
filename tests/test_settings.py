@@ -69,6 +69,23 @@ class TestEnvironmentResolution:
         assert "LOKI_URL" not in os.environ
 
 
+class TestAllowedHosts:
+    def test_defaults_cover_localhost_and_the_compose_services(self, monkeypatch):
+        monkeypatch.delenv("AEGIS_ALLOWED_HOSTS", raising=False)
+        assert set(Settings().allowed_hosts) == {"localhost", "127.0.0.1", "control", "checkout", "inventory"}
+
+    def test_configured_hosts_extend_the_defaults(self, monkeypatch):
+        monkeypatch.setenv("AEGIS_ALLOWED_HOSTS", "ops.example.com, *.internal.example")
+        hosts = Settings().allowed_hosts
+        assert {"ops.example.com", "*.internal.example", "localhost"} <= set(hosts)
+
+    @pytest.mark.parametrize("entry", ["*", "https://ops.example.com", "ops.example.com:8000", "ops/example", "bad host", "-x"])
+    def test_malformed_entries_name_the_variable(self, monkeypatch, entry):
+        monkeypatch.setenv("AEGIS_ALLOWED_HOSTS", entry)
+        with pytest.raises(SettingsError, match="AEGIS_ALLOWED_HOSTS entry"):
+            Settings()
+
+
 class TestFailFastValidation:
     @pytest.mark.parametrize(
         "name",
@@ -79,6 +96,7 @@ class TestFailFastValidation:
             "AEGIS_SIGNAL_EVENT_INTERVAL",
             "AEGIS_RATE_LIMIT_MAX",
             "AEGIS_RATE_LIMIT_WINDOW",
+            "AEGIS_RATE_LIMIT_MUTATION_MAX",
             "AEGIS_AUTH_FAIL_MAX",
             "AEGIS_AUTH_FAIL_WINDOW",
             "AEGIS_MAX_BODY_BYTES",

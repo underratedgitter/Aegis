@@ -1,5 +1,6 @@
 """docker-compose.yml passes the hardening settings through with the same defaults as Settings."""
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -8,33 +9,50 @@ import yaml
 
 from aegis.settings import Settings
 
-COMPOSE = yaml.safe_load((Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text())
+ROOT = Path(__file__).resolve().parent.parent
+COMPOSE = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
 
-# Variable -> (Settings attribute, services that read it)
+# Settings the control plane does not take from the environment of the host: Compose pins them to
+# the service names and container paths of its own network.
+NOT_PASSED_THROUGH = frozenset(
+    {
+        "PROMETHEUS_URL",
+        "LOKI_URL",
+        "CHECKOUT_URL",
+        "INVENTORY_URL",
+        "PORT",
+        "AEGIS_DB_PATH",
+        "AEGIS_LOG_DIR",
+        "AEGIS_RUNBOOK_DIR",
+    }
+)
+# The Aegis settings the demo services read as well (the aegis-security-env anchor).
+ALL_AEGIS_SERVICES = ("control", "checkout", "inventory")
+SHARED = frozenset(
+    {
+        "AEGIS_CORS_ORIGINS",
+        "AEGIS_ALLOWED_HOSTS",
+        "AEGIS_AUTH_FAIL_MAX",
+        "AEGIS_AUTH_FAIL_WINDOW",
+        "AEGIS_MAX_BODY_BYTES",
+    }
+)
+
+# Derived from Settings, so a new setting without a Compose passthrough fails here.
+ENVIRONMENT = {field.metadata["env"]: field.name for field in dataclasses.fields(Settings) if "env" in field.metadata}
 PASSTHROUGH = {
-    "AEGIS_CORS_ORIGINS": ("cors_origins_raw", ("control", "checkout", "inventory")),
-    "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", ("control", "checkout", "inventory")),
-    "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", ("control", "checkout", "inventory")),
-    "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", ("control", "checkout", "inventory")),
-    "AEGIS_POLL_SECONDS": ("poll_seconds", ("control",)),
-    "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", ("control",)),
-    "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", ("control",)),
-    "AEGIS_DETECTION_CYCLES": ("detection_cycles", ("control",)),
-    "AEGIS_BLIND_SECONDS": ("blind_seconds", ("control",)),
-    "AEGIS_REOPEN_COOLDOWN_SECONDS": ("reopen_cooldown_seconds", ("control",)),
-    "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", ("control",)),
-    "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", ("control",)),
-    "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", ("control",)),
-    "AEGIS_SHUTDOWN_GRACE_SECONDS": ("shutdown_grace_seconds", ("control",)),
-    "AEGIS_REMEDIATION_MAX_ATTEMPTS": ("remediation_max_attempts", ("control",)),
-    "AEGIS_REMEDIATION_BACKOFF_MS": ("remediation_backoff_ms", ("control",)),
-    "AEGIS_REMEDIATION_TIMEOUT_SECONDS": ("remediation_timeout_seconds", ("control",)),
-    "AEGIS_REMEDIATION_MAX_PER_WINDOW": ("remediation_max_per_window", ("control",)),
-    "AEGIS_REMEDIATION_WINDOW_SECONDS": ("remediation_window_seconds", ("control",)),
-    "AEGIS_REMEDIATION_VERIFY_SECONDS": ("remediation_verify_seconds", ("control",)),
-    "AEGIS_REMEDIATION_VERIFY_INTERVAL": ("remediation_verify_interval", ("control",)),
-    "AEGIS_REMEDIATION_ALLOWED_ACTIONS": ("remediation_allowed_actions_raw", ("control",)),
+    name: (attribute, ALL_AEGIS_SERVICES if name in SHARED else ("control",))
+    for name, attribute in ENVIRONMENT.items()
+    if name not in NOT_PASSED_THROUGH
 }
+
+
+def test_every_setting_names_its_environment_variable():
+    assert [field.name for field in dataclasses.fields(Settings) if "env" not in field.metadata] == []
+
+
+def test_the_exclusion_and_shared_lists_name_real_settings():
+    assert set(ENVIRONMENT) >= (NOT_PASSED_THROUGH | SHARED)
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +74,29 @@ def test_variable_is_passed_with_the_settings_default(name, attribute, service):
 
     match = re.fullmatch(r"\$\{" + name + r":-(.*)\}", str(value))
     assert match, f"{service} must pass {name} as ${{{name}:-default}}, got {value!r}"
-    assert match.group(1) == str(getattr(Settings(), attribute))
+    default = getattr(Settings(), attribute)
+    assert match.group(1) == (str(default).lower() if isinstance(default, bool) else str(default))
+
+
+def test_prometheus_does_not_expose_unauthenticated_lifecycle_endpoints():
+    # --web.enable-lifecycle serves /-/quit and /-/reload to anyone who can reach the port.
+    command = COMPOSE["services"]["prometheus"]["command"]
+
+    assert not any("enable-lifecycle" in str(argument) for argument in command)
+    assert not any("enable-admin-api" in str(argument) for argument in command)
+
+
+def test_promtail_keeps_its_read_positions_on_a_volume():
+    # In /tmp the positions vanish with the container, so every recreate re-ships all logs to Loki.
+    config = yaml.safe_load((ROOT / "observability/promtail.yml").read_text())
+    positions = Path(config["positions"]["filename"])
+    writable_volumes = []
+    for mount in COMPOSE["services"]["promtail"]["volumes"]:
+        source, target, *mode = mount.split(":")
+        if not source.startswith((".", "/")) and "ro" not in mode:
+            writable_volumes.append((source, Path(target)))
+
+    assert any(target in positions.parents and source in COMPOSE["volumes"] for source, target in writable_volumes)
 
 
 def test_dry_run_is_passed_with_the_settings_default(monkeypatch):

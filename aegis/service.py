@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ from aegis.http_security import (
     BodyLimitMiddleware,
     SecurityHeadersMiddleware,
     internal_error_response,
+    request_id,
 )
 from aegis.logging_utils import configure_logging
 from aegis.settings import Settings
@@ -33,6 +35,8 @@ LOG_PATH = os.getenv("LOG_PATH", f"./logs/{SERVICE}.jsonl")
 logger = configure_logging(SERVICE, LOG_PATH)
 _settings = Settings()
 _auth_failures = AuthFailureLimiter(_settings.auth_fail_max, _settings.auth_fail_window)
+
+UNMATCHED_ROUTE = "unmatched"
 
 HTTP_REQUESTS = Counter(
     "aegis_http_requests_total", "HTTP requests handled", ["service", "method", "route", "status"]
@@ -258,24 +262,27 @@ async def metrics() -> Response:
 async def observe(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    rid = request_id(request.headers.get("x-request-id"))
     started = time.perf_counter()
-    route = request.url.path
     status = 500
     try:
         response = await call_next(request)
         status = response.status_code
-        response.headers["x-request-id"] = request_id
+        response.headers["x-request-id"] = rid
         return response
     finally:
         elapsed = time.perf_counter() - started
+        # The route template, not the raw path: any client can invent paths, and every
+        # distinct label value would live in the process and in Prometheus for good.
+        matched = request.scope.get("route")
+        route = getattr(matched, "path", None) or UNMATCHED_ROUTE
         HTTP_REQUESTS.labels(SERVICE, request.method, route, str(status)).inc()
         HTTP_LATENCY.labels(SERVICE, request.method, route).observe(elapsed)
         logger.info(
             "request_completed",
             extra={
                 "service": SERVICE,
-                "request_id": request_id,
+                "request_id": rid,
                 "route": route,
                 "status": status,
                 "duration_ms": round(elapsed * 1000, 2),
@@ -283,6 +290,7 @@ async def observe(
         )
 
 
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(_settings.allowed_hosts))
 app.add_middleware(SecurityHeadersMiddleware, csp=API_CSP)
 app.add_exception_handler(Exception, internal_error_response)
 

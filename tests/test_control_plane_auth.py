@@ -13,6 +13,7 @@ PROTECTED_ROUTES = [
     ("post", "/api/incidents/inc-auth-1/investigate"),
     ("post", "/api/incidents/inc-auth-1/approve"),
     ("post", "/api/incidents/inc-auth-1/execute"),
+    ("post", "/api/incidents/inc-auth-1/resolve"),
     ("post", "/api/incidents/batch/approve"),
     ("post", "/api/chaos"),
     ("post", "/api/engine/run-once"),
