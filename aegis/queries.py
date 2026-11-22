@@ -10,14 +10,18 @@ from __future__ import annotations
 
 from typing import Final
 
+# Only API routes count: Prometheus scrapes /metrics and Docker probes /healthz every few
+# seconds, and those fast successes would dilute the error rate and pull p95 down.
+API_ROUTES: Final = 'route=~"/api/.*"'
+
 CHECKOUT_ERROR_RATE: Final = (
-    'sum(rate(aegis_http_requests_total{service="checkout",status=~"5.."}[2m])) '
-    '/ clamp_min(sum(rate(aegis_http_requests_total{service="checkout"}[2m])), 0.001)'
+    f'sum(rate(aegis_http_requests_total{{service="checkout",{API_ROUTES},status=~"5.."}}[2m])) '
+    f'/ clamp_min(sum(rate(aegis_http_requests_total{{service="checkout",{API_ROUTES}}}[2m])), 0.001)'
 )
 
 CHECKOUT_P95_LATENCY: Final = (
     "histogram_quantile(0.95, sum(rate(aegis_http_request_duration_seconds_bucket"
-    '{service="checkout"}[2m])) by (le))'
+    f'{{service="checkout",{API_ROUTES}}}[2m])) by (le))'
 )
 
 INVENTORY_DEPENDENCY_ERRORS: Final = (
@@ -32,11 +36,11 @@ CHECKOUT_DOWN: Final = '1 - min(up{job="checkout"})'
 CHECKOUT_CPU_BURN: Final = 'aegis_cpu_burn_active{service="checkout"}'
 
 CHECKOUT_REQUESTS_30M: Final = (
-    'sum(increase(aegis_http_requests_total{service="checkout"}[30m]))'
+    f'sum(increase(aegis_http_requests_total{{service="checkout",{API_ROUTES}}}[30m]))'
 )
 
 CHECKOUT_ERRORS_30M: Final = (
-    'sum(increase(aegis_http_requests_total{service="checkout",status=~"5.."}[30m]))'
+    f'sum(increase(aegis_http_requests_total{{service="checkout",{API_ROUTES},status=~"5.."}}[30m]))'
 )
 
 # Above this rate, checkout symptoms are attributed to the inventory dependency

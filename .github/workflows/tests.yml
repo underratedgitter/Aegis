@@ -2,7 +2,6 @@ name: Tests
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -42,3 +41,16 @@ jobs:
 
       - name: Run tests
         run: pytest -q --cov=aegis --cov-report=term-missing
+
+  docker:
+    name: compose and image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate the Compose file
+        run: docker compose config -q
+
+      - name: Build the image
+        run: docker build -t aegis:ci .

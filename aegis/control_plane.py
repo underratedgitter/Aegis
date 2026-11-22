@@ -7,7 +7,6 @@ import io
 import sqlite3
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,19 +16,23 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
+from aegis import __version__
 from aegis.agent import LLM_BREAKER_COOLDOWN_SECONDS, LLM_BREAKER_FAILURES, AgentInvestigator
 from aegis.auth import AuthFailureLimiter, bearer_header, presented_token, token_matches
 from aegis.breaker import CircuitBreaker
+from aegis.errors import error_summary
 from aegis.http_security import (
     DOCS_CSP,
     UI_CSP,
     BodyLimitMiddleware,
     SecurityHeadersMiddleware,
     internal_error_response,
+    request_id,
 )
 from aegis.logging_utils import configure_logging
 from aegis.models import (
@@ -101,23 +104,35 @@ _rate_limits: dict[str, list[float]] = {}
 _rate_limit_lock = threading.Lock()
 RATE_LIMIT_WINDOW = settings.rate_limit_window
 RATE_LIMIT_MAX_REQUESTS = settings.rate_limit_max
+RATE_LIMIT_MUTATION_MAX_REQUESTS = settings.rate_limit_mutation_max
+# Health probes, scrapes and the static UI are cheap and polled by machines, so they are
+# not counted; they would otherwise eat the budget the operator's own clicks need.
+RATE_LIMIT_EXEMPT_PATHS = frozenset({"/", "/healthz", "/readyz", "/metrics"})
+RATE_LIMIT_EXEMPT_PREFIX = "/static/"
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-def _check_rate_limit(client_ip: str) -> None:
+def _check_rate_limit(client_ip: str, mutation: bool = False) -> None:
     """
-    Allow at most RATE_LIMIT_MAX_REQUESTS per client per window.
+    Allow at most RATE_LIMIT_MAX_REQUESTS reads or RATE_LIMIT_MUTATION_MAX_REQUESTS
+    mutations per client per window.
 
-    Buckets that fall empty are dropped so a long-running control plane does not
-    accumulate one list per source address it has ever seen.
+    Reads and mutations have separate budgets, so a few tabs polling the API cannot
+    lock an operator out of Approve and Execute. Buckets that fall empty are dropped
+    so a long-running control plane does not accumulate one list per source address
+    it has ever seen. The window is measured on the monotonic clock: a wall-clock
+    step must not unlock or lock out clients.
     """
-    now = time.time()
+    limit = RATE_LIMIT_MUTATION_MAX_REQUESTS if mutation else RATE_LIMIT_MAX_REQUESTS
+    bucket = f"mutation:{client_ip}" if mutation else client_ip
+    now = time.monotonic()
     with _rate_limit_lock:
-        recent = [t for t in _rate_limits.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW]
-        if len(recent) >= RATE_LIMIT_MAX_REQUESTS:
-            _rate_limits[client_ip] = recent
+        recent = [t for t in _rate_limits.get(bucket, []) if now - t < RATE_LIMIT_WINDOW]
+        if len(recent) >= limit:
+            _rate_limits[bucket] = recent
             raise HTTPException(status_code=429, detail="Rate limit exceeded.")
         recent.append(now)
-        _rate_limits[client_ip] = recent
+        _rate_limits[bucket] = recent
 
         # Evict clients that have gone quiet for a full window.
         if len(_rate_limits) > 1024:
@@ -193,7 +208,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             store.close()
 
 
-app = FastAPI(title="Aegis SRE Copilot", version="0.3.0", lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(title="Aegis SRE Copilot", version=__version__, lifespan=lifespan, docs_url="/docs", redoc_url="/redoc")
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -203,21 +218,26 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
 
 
+def _rate_limit_exempt(path: str) -> bool:
+    return path in RATE_LIMIT_EXEMPT_PATHS or path.startswith(RATE_LIMIT_EXEMPT_PREFIX)
+
+
 @app.middleware("http")
 async def request_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4())[:8])
-    request.state.request_id = request_id
+    rid = request_id(request.headers.get("X-Request-Id"))
+    request.state.request_id = rid
     client_ip = request.client.host if request.client else "unknown"
     try:
-        _check_rate_limit(client_ip)
+        if not _rate_limit_exempt(request.url.path):
+            _check_rate_limit(client_ip, mutation=request.method not in READ_METHODS)
     except HTTPException as exc:
         # Middleware runs outside FastAPI's exception handlers, so a raised
         # HTTPException here surfaced as a 500 instead of the intended 429.
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"X-Request-Id": request_id})
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"X-Request-Id": rid})
     response = await call_next(request)
-    response.headers["X-Request-Id"] = request_id
+    response.headers["X-Request-Id"] = rid
     return response
 
 
@@ -226,11 +246,14 @@ def _install_hardening(application: FastAPI, cfg: Settings) -> None:
     Add the request/response guards; the last one added is the outermost.
 
     Security headers wrap everything, so CORS preflights and 413s carry them too.
+    The Host header is checked first of the guards: a page that DNS-rebinds its own
+    name to this address reaches the API with that name in Host, and is refused.
     CORS sits outside the body limit so browsers can read a 413. With no
     AEGIS_CORS_ORIGINS there is no CORS middleware and browsers keep their
     same-origin default. Aegis authenticates with a bearer token, not cookies,
     so credentials stay off.
     """
+    application.add_middleware(TrustedHostMiddleware, allowed_hosts=list(cfg.allowed_hosts))
     if cfg.cors_origins:
         application.add_middleware(
             CORSMiddleware,
@@ -464,7 +487,7 @@ def chaos(request: ChaosRequest) -> ChaosResponse:
         _audit("chaos_inject", {"service": request.service, "fault": request.fault})
         return ChaosResponse(status="injected", service=request.service, result=response.json())
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Demo service unavailable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Demo service unavailable: {error_summary(exc)}") from exc
 
 
 @app.get("/api/metrics")
@@ -495,7 +518,8 @@ def _service_status(name: str, url: str) -> ServiceStatus:
         response = httpx.get(f"{url.rstrip('/')}/healthz", timeout=1)
         return ServiceStatus(name=name, available=response.is_success, status_code=response.status_code)
     except httpx.HTTPError as exc:
-        return ServiceStatus(name=name, available=False, error=str(exc))
+        logger.warning("Health check of %s failed: %s", name, exc)
+        return ServiceStatus(name=name, available=False, error=error_summary(exc))
 
 
 def _prometheus_status() -> TelemetryStatus:

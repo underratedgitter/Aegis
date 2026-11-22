@@ -19,6 +19,8 @@ _TMP_DIR = tempfile.mkdtemp(prefix="aegis-tests-")
 
 os.environ["AEGIS_DB_PATH"] = str(Path(_TMP_DIR) / "aegis.db")
 os.environ.setdefault("AEGIS_LOG_DIR", str(Path(_TMP_DIR) / "logs"))
+# Starlette's TestClient sends "Host: testserver", which the Host-header allowlist refuses by default.
+os.environ["AEGIS_ALLOWED_HOSTS"] = "testserver"
 # Remediation retries must not make failure-path tests sleep.
 os.environ.setdefault("AEGIS_REMEDIATION_BACKOFF_MS", "0")
 

@@ -76,7 +76,7 @@ def test_retries_are_bounded(telemetry, clock, monkeypatch):
 
     assert get.calls == telemetry_module.QUERY_ATTEMPTS
     assert result["value"] is None
-    assert "refused" in result["error"]
+    assert "ConnectError" in result["error"]  # the class, not the library's message
 
 
 def test_client_errors_are_not_retried_and_do_not_trip_the_breaker(telemetry, clock, monkeypatch):
