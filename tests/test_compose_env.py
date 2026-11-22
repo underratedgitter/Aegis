@@ -59,6 +59,14 @@ def test_variable_is_passed_with_the_settings_default(name, attribute, service):
     assert match.group(1) == str(getattr(Settings(), attribute))
 
 
+def test_prometheus_does_not_expose_unauthenticated_lifecycle_endpoints():
+    # --web.enable-lifecycle serves /-/quit and /-/reload to anyone who can reach the port.
+    command = COMPOSE["services"]["prometheus"]["command"]
+
+    assert not any("enable-lifecycle" in str(argument) for argument in command)
+    assert not any("enable-admin-api" in str(argument) for argument in command)
+
+
 def test_dry_run_is_passed_with_the_settings_default(monkeypatch):
     monkeypatch.delenv("AEGIS_REMEDIATION_DRY_RUN", raising=False)
     value = COMPOSE["services"]["control"]["environment"]["AEGIS_REMEDIATION_DRY_RUN"]
