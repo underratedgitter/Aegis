@@ -19,6 +19,8 @@ _TMP_DIR = tempfile.mkdtemp(prefix="aegis-tests-")
 
 os.environ["AEGIS_DB_PATH"] = str(Path(_TMP_DIR) / "aegis.db")
 os.environ.setdefault("AEGIS_LOG_DIR", str(Path(_TMP_DIR) / "logs"))
+# Remediation retries must not make failure-path tests sleep.
+os.environ.setdefault("AEGIS_REMEDIATION_BACKOFF_MS", "0")
 
 # The suite must never authenticate by accident against a developer's real key.
 os.environ.pop("AEGIS_API_KEY", None)

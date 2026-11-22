@@ -17,6 +17,14 @@ PASSTHROUGH = {
     "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", ("control", "checkout", "inventory")),
     "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", ("control", "checkout", "inventory")),
     "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", ("control",)),
+    "AEGIS_REMEDIATION_MAX_ATTEMPTS": ("remediation_max_attempts", ("control",)),
+    "AEGIS_REMEDIATION_BACKOFF_MS": ("remediation_backoff_ms", ("control",)),
+    "AEGIS_REMEDIATION_TIMEOUT_SECONDS": ("remediation_timeout_seconds", ("control",)),
+    "AEGIS_REMEDIATION_MAX_PER_WINDOW": ("remediation_max_per_window", ("control",)),
+    "AEGIS_REMEDIATION_WINDOW_SECONDS": ("remediation_window_seconds", ("control",)),
+    "AEGIS_REMEDIATION_VERIFY_SECONDS": ("remediation_verify_seconds", ("control",)),
+    "AEGIS_REMEDIATION_VERIFY_INTERVAL": ("remediation_verify_interval", ("control",)),
+    "AEGIS_REMEDIATION_ALLOWED_ACTIONS": ("remediation_allowed_actions_raw", ("control",)),
 }
 
 
@@ -40,3 +48,10 @@ def test_variable_is_passed_with_the_settings_default(name, attribute, service):
     match = re.fullmatch(r"\$\{" + name + r":-(.*)\}", str(value))
     assert match, f"{service} must pass {name} as ${{{name}:-default}}, got {value!r}"
     assert match.group(1) == str(getattr(Settings(), attribute))
+
+
+def test_dry_run_is_passed_with_the_settings_default(monkeypatch):
+    monkeypatch.delenv("AEGIS_REMEDIATION_DRY_RUN", raising=False)
+    value = COMPOSE["services"]["control"]["environment"]["AEGIS_REMEDIATION_DRY_RUN"]
+
+    assert value == "${AEGIS_REMEDIATION_DRY_RUN:-" + str(Settings().remediation_dry_run).lower() + "}"
