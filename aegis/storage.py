@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from aegis.models import ExecutionState
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -78,6 +80,24 @@ class Store:
               data_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS events_incident_idx ON events(incident_id, id);
+            CREATE TABLE IF NOT EXISTS remediation_executions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              idempotency_key TEXT NOT NULL UNIQUE,
+              incident_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target TEXT NOT NULL,
+              parameters_json TEXT NOT NULL DEFAULT '{}',
+              approver TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS remediation_incident_idx
+              ON remediation_executions(incident_id, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
+              ON remediation_executions(target) WHERE state = 'in_flight';
             """
         )
         self.db.commit()
@@ -287,6 +307,22 @@ class Store:
             rows = self.db.execute("SELECT id FROM incidents WHERE status = 'executing'").fetchall()
             recovered = [row["id"] for row in rows]
             for incident_id in recovered:
+                latest = self.db.execute(
+                    "SELECT * FROM remediation_executions WHERE incident_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (incident_id,),
+                ).fetchone()
+                execution = self._execution(latest)
+                if execution and execution["state"] == ExecutionState.SUCCEEDED:
+                    # The action was applied and recorded; only the incident write was lost.
+                    self.merge_incident(incident_id, {"remediation": execution["detail"]}, status="open")
+                    self.add_event(
+                        incident_id,
+                        "remediation_executed",
+                        "Remediation completed before a control-plane restart; recovered its result.",
+                        {"idempotency_key": execution["idempotency_key"]},
+                    )
+                    continue
                 self.db.execute(
                     "UPDATE incidents SET status = 'approved' WHERE id = ?", (incident_id,)
                 )
@@ -297,8 +333,122 @@ class Store:
                     "may not have been applied. Check the target, then retry Execute if needed.",
                     commit=False,
                 )
+            self.db.execute(
+                "UPDATE remediation_executions SET state = ?, finished_at = ?, detail_json = ? "
+                "WHERE state = ?",
+                (
+                    ExecutionState.UNKNOWN.value,
+                    utc_now(),
+                    json.dumps({"error": "interrupted by a control-plane restart"}),
+                    ExecutionState.IN_FLIGHT.value,
+                ),
+            )
             self.db.commit()
             return recovered
+
+    @staticmethod
+    def _execution(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["parameters"] = json.loads(result.pop("parameters_json") or "{}")
+        result["detail"] = json.loads(result.pop("detail_json") or "{}")
+        return result
+
+    def get_execution(self, idempotency_key: str) -> dict[str, Any] | None:
+        """Get the execution record for an idempotency key."""
+        with self.lock:
+            return self._execution(
+                self.db.execute(
+                    "SELECT * FROM remediation_executions WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+            )
+
+    def executions(self, incident_id: str) -> list[dict[str, Any]]:
+        """Get an incident's execution records, oldest first."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM remediation_executions WHERE incident_id = ? ORDER BY id",
+                (incident_id,),
+            ).fetchall()
+            return [item for item in (self._execution(row) for row in rows) if item is not None]
+
+    def claim_execution(
+        self,
+        idempotency_key: str,
+        incident_id: str,
+        action: str,
+        target: str,
+        parameters: dict[str, Any],
+        approver: str,
+        *,
+        max_per_window: int,
+        window_seconds: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Atomically reserve the right to run one action, enforcing the guardrails.
+
+        Returns:
+            ("claimed", row) when the caller may call the target now (a first claim, or
+            a retry of an attempt that is known not to have applied); ("existing", row)
+            when the key was already claimed and must not be repeated; ("target_busy",
+            row) when another execution is in flight on the target; ("rate_limited",
+            row) with the oldest execution still counted in the window.
+        """
+        with self.lock:
+            existing = self.get_execution(idempotency_key)
+            if existing and existing["state"] != ExecutionState.FAILED:
+                return "existing", existing
+            busy = self.db.execute(
+                "SELECT * FROM remediation_executions WHERE target = ? AND state = ?",
+                (target, ExecutionState.IN_FLIGHT.value),
+            ).fetchone()
+            if busy is not None:
+                return "target_busy", self._execution(busy) or {}
+            now = utc_now()
+            cutoff = (datetime.fromisoformat(now) - timedelta(seconds=window_seconds)).isoformat()
+            counted = self.db.execute(
+                "SELECT * FROM remediation_executions WHERE target = ? AND started_at >= ? "
+                "AND state != ? ORDER BY started_at",
+                (target, cutoff, ExecutionState.FAILED.value),
+            ).fetchall()
+            if len(counted) >= max_per_window:
+                return "rate_limited", self._execution(counted[0]) or {}
+            if existing:
+                self.db.execute(
+                    "UPDATE remediation_executions SET state = ?, approver = ?, attempts = 0, "
+                    "started_at = ?, finished_at = NULL, detail_json = '{}' WHERE idempotency_key = ?",
+                    (ExecutionState.IN_FLIGHT.value, approver, now, idempotency_key),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO remediation_executions(idempotency_key,incident_id,action,target,"
+                    "parameters_json,approver,state,started_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        idempotency_key,
+                        incident_id,
+                        action,
+                        target,
+                        json.dumps(parameters),
+                        approver,
+                        ExecutionState.IN_FLIGHT.value,
+                        now,
+                    ),
+                )
+            self.db.commit()
+            return "claimed", self.get_execution(idempotency_key) or {}
+
+    def finish_execution(
+        self, idempotency_key: str, state: str, attempts: int, detail: dict[str, Any]
+    ) -> None:
+        """Record how an execution ended; `detail` is the full outcome kept for the audit trail."""
+        with self.lock:
+            self.db.execute(
+                "UPDATE remediation_executions SET state = ?, attempts = ?, finished_at = ?, "
+                "detail_json = ? WHERE idempotency_key = ?",
+                (state, attempts, utc_now(), json.dumps(detail), idempotency_key),
+            )
+            self.db.commit()
 
     def add_event(
         self,
@@ -336,6 +486,24 @@ class Store:
                 item["data"] = json.loads(item.pop("data_json") or "{}")
                 result.append(item)
             return result
+
+    def incident_status_counts(self) -> dict[str, int]:
+        """Number of incidents in each status."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT status, COUNT(*) AS n FROM incidents GROUP BY status"
+            ).fetchall()
+        return {row["status"]: row["n"] for row in rows}
+
+    def event_counts(self, kinds: Collection[str]) -> dict[str, int]:
+        """Number of timeline events of each of the given kinds, across all incidents."""
+        marks = ",".join("?" * len(kinds))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT kind, COUNT(*) AS n FROM events WHERE kind IN ({marks}) GROUP BY kind",
+                tuple(kinds),
+            ).fetchall()
+        return {row["kind"]: row["n"] for row in rows}
 
     def resolved_durations(self) -> list[float]:
         """Get durations (in seconds) for all resolved incidents."""

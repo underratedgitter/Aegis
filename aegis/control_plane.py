@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
-from aegis.agent import AgentInvestigator
+from aegis.agent import LLM_BREAKER_COOLDOWN_SECONDS, LLM_BREAKER_FAILURES, AgentInvestigator
 from aegis.auth import AuthFailureLimiter, bearer_header, presented_token, token_matches
+from aegis.breaker import CircuitBreaker
 from aegis.http_security import (
     DOCS_CSP,
     UI_CSP,
@@ -29,7 +31,6 @@ from aegis.http_security import (
     SecurityHeadersMiddleware,
     internal_error_response,
 )
-from aegis.incidents import IncidentEngine
 from aegis.logging_utils import configure_logging
 from aegis.models import (
     ApprovalRequest,
@@ -47,15 +48,15 @@ from aegis.models import (
     ServiceStatus,
     TelemetryStatus,
 )
-from aegis.remediation import RemediationError, RemediationExecutor
+from aegis.remediation import RemediationError, RemediationExecutor, no_remediation_reason
+from aegis.selfmetrics import ControlPlaneCollector
 from aegis.settings import Settings
 from aegis.storage import Store, utc_now
+from aegis.supervisor import EngineStatus, SupervisedEngine
 from aegis.telemetry import Telemetry
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
-
-    from starlette.responses import Response
 
 logger = configure_logging("aegis-control-plane")
 settings = Settings()
@@ -64,9 +65,21 @@ store = Store(
     settings.db_path, settings.max_evidence_history, settings.signal_event_interval
 )
 telemetry = Telemetry(settings)
-engine = IncidentEngine(settings, store, telemetry)
-agent = AgentInvestigator(settings, store, telemetry)
-remediation = RemediationExecutor(settings, store)
+llm_breaker = CircuitBreaker("llm", LLM_BREAKER_FAILURES, LLM_BREAKER_COOLDOWN_SECONDS)
+agent = AgentInvestigator(settings, store, telemetry, llm_breaker=llm_breaker)
+engine = SupervisedEngine(
+    settings,
+    store,
+    telemetry,
+    breakers={
+        "prometheus": telemetry.prometheus_breaker,
+        "loki": telemetry.loki_breaker,
+        "llm": llm_breaker,
+    },
+)
+# One investigator for manual and automatic investigations, so they share the LLM breaker.
+engine.agent = agent
+REGISTRY.register(ControlPlaneCollector(store, engine))
 
 # ─── Audit Log ────────────────────────────────────────────────────────────────
 
@@ -77,6 +90,9 @@ _audit_log: deque[dict[str, Any]] = deque(maxlen=AUDIT_LOG_MAX_ENTRIES)
 def _audit(action: str, detail: dict[str, Any]) -> None:
     """Record an audit event. The buffer is bounded; oldest entries are dropped."""
     _audit_log.append({"action": action, "at": utc_now(), **detail})
+
+
+remediation = RemediationExecutor(settings, store, telemetry=telemetry, audit=_audit)
 
 
 # ─── Rate Limiting ────────────────────────────────────────────────────────────
@@ -162,6 +178,7 @@ PROTECTED = [Depends(verify_api_key)]
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     _warn_if_unauthenticated()
     store.recover_interrupted_executions()
+    remediation.resume_verifications()
     engine.start()
     try:
         yield
@@ -170,8 +187,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
             engine.stop()
         finally:
-            telemetry.close()
+            # Verification threads read telemetry and write the store, so they stop first.
             remediation.close()
+            telemetry.close()
             store.close()
 
 
@@ -246,8 +264,15 @@ def healthz() -> HealthResponse:
 
 @app.get("/readyz", response_model=ReadyResponse)
 def readyz() -> ReadyResponse | JSONResponse:
-    """Readiness: 503 if the database or engine is broken; Prometheus/Loki only degrade it."""
-    checks = {"database": "ok", "engine": "ok" if engine.is_running else "stopped"}
+    """
+    Readiness: 503 if the database is broken or the engine is stopped or stalled.
+
+    A failing engine with a fresh heartbeat, and Prometheus/Loki outages, only degrade it.
+    """
+    engine_status = engine.status()
+    checks: dict[str, str] = {"database": "ok", "engine": engine_status.state}
+    if engine_status.reason:
+        checks["engine_reason"] = engine_status.reason
     try:
         store.ping()
     except sqlite3.Error:
@@ -255,9 +280,9 @@ def readyz() -> ReadyResponse | JSONResponse:
         checks["database"] = "error"
     checks["prometheus"] = "ok" if _prometheus_status().available else "unavailable"
     checks["loki"] = "ok" if telemetry.loki_status().available else "unavailable"
-    if checks["database"] != "ok" or checks["engine"] != "ok":
+    if checks["database"] != "ok" or engine_status.state in {"stopped", "stalled"}:
         status = "unavailable"
-    elif "unavailable" in checks.values():
+    elif "unavailable" in checks.values() or engine_status.state == "degraded":
         status = "degraded"
     else:
         status = "ok"
@@ -265,6 +290,18 @@ def readyz() -> ReadyResponse | JSONResponse:
     if status == "unavailable":
         return JSONResponse(status_code=503, content=body.model_dump())
     return body
+
+
+@app.get("/api/engine/status", response_model=EngineStatus)
+def engine_status() -> EngineStatus:
+    """Engine heartbeat (last success, last error, consecutive failures) and backend breakers."""
+    return engine.status()
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> Response:
+    """Prometheus exposition of the control plane's own health."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/api/overview", response_model=OverviewResponse)
@@ -326,7 +363,7 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
     for inc in pending:
         rec = inc["data"].get("recommendation") or {}
         try:
-            remediation.validate_recommendation(rec)
+            remediation.ensure_permitted(rec)
         except RemediationError:
             continue
         approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": rec}
@@ -370,9 +407,11 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         raise HTTPException(status_code=404, detail="Incident not found")
     if incident["status"] != "recommendation_pending":
         raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
+    if reason := no_remediation_reason(incident):
+        raise HTTPException(status_code=409, detail=reason)
     recommendation = incident["data"].get("recommendation") or {}
     try:
-        remediation.validate_recommendation(recommendation)
+        remediation.ensure_permitted(recommendation)
     except RemediationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     approval = {"approver": request.approver, "approved_at": utc_now(), "recommendation": recommendation}
@@ -391,8 +430,9 @@ def execute(incident_id: str, request: ApprovalRequest) -> ExecuteResponse:
     try:
         result = remediation.execute(incident_id, request.approver)
     except RemediationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _audit("execute", {"incident_id": incident_id, "approver": request.approver})
+        # 409 refused, 429 over the limit, 502 the service did not accept the action.
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(status_code=exc.status_code, detail=str(exc), headers=headers) from exc
     return ExecuteResponse(**result)
 
 

@@ -20,6 +20,24 @@ class IncidentStatus(StrEnum):
     CLOSED = "closed"
 
 
+class ExecutionState(StrEnum):
+    """Lifecycle of one remediation execution record (one per idempotency key)."""
+
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"  # known not to have been applied; safe to try again
+    UNKNOWN = "unknown"  # may have been applied; must be reconciled before another attempt
+
+
+class VerificationState(StrEnum):
+    """Outcome of re-checking the triggering signal after a successful action."""
+
+    VERIFYING = "verifying"
+    VERIFIED = "verified"
+    FAILED = "failed"  # the action succeeded but the signal still fires: escalated
+    UNVERIFIED = "unverified"  # the signal could not be read in the window: escalated
+
+
 class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -30,6 +48,13 @@ class Severity(StrEnum):
 class InvestigationMode(StrEnum):
     LOCAL_FALLBACK = "local_fallback"
     LLM_TOOL_CALLING = "llm_tool_calling"
+
+
+# Incident vocabulary shared by detection (which raises these) and remediation (which refuses them).
+# Root cause under which prolonged telemetry blindness is recorded.
+BLIND_ROOT = "telemetry:blind"
+# The rule whose reading says whether the checkout target answers scrapes at all.
+LIVENESS_RULE = "checkout_down"
 
 
 class RemediationAction(StrEnum):
@@ -57,7 +82,8 @@ class Investigation(BaseModel):
     hypothesis: str
     confidence: str = Field(pattern="^(low|medium|high)$")
     evidence: list[Evidence] = Field(default_factory=list)
-    recommendation: Recommendation
+    # None when no safe automated action exists (telemetry blind, checkout not answering).
+    recommendation: Recommendation | None = None
     next_checks: list[str] = Field(default_factory=list)
     tools_used: list[str] = Field(default_factory=list)
     generated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -189,11 +215,16 @@ class ApprovalResponse(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
+    """"executed", "already_executed" (this approval ran before) or "dry_run" (nothing changed)."""
+
     status: str = "executed"
     incident_id: str
     action: str
     target: str
     result: dict[str, Any]
+    idempotency_key: str | None = None
+    attempts: int | None = None
+    verification: str | None = None
 
 
 class MetricSnapshot(BaseModel):

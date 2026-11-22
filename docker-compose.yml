@@ -33,7 +33,16 @@ services:
     command: python -m aegis.control_main
     environment:
       <<: *aegis-security-env
+      AEGIS_POLL_SECONDS: ${AEGIS_POLL_SECONDS:-5}
+      AEGIS_RESOLUTION_CYCLES: ${AEGIS_RESOLUTION_CYCLES:-2}
       AEGIS_SIGNAL_EVENT_INTERVAL: ${AEGIS_SIGNAL_EVENT_INTERVAL:-60}
+      AEGIS_DETECTION_CYCLES: ${AEGIS_DETECTION_CYCLES:-2}
+      AEGIS_BLIND_SECONDS: ${AEGIS_BLIND_SECONDS:-300}
+      AEGIS_REOPEN_COOLDOWN_SECONDS: ${AEGIS_REOPEN_COOLDOWN_SECONDS:-300}
+      AEGIS_CYCLE_TIMEOUT_SECONDS: ${AEGIS_CYCLE_TIMEOUT_SECONDS:-60}
+      AEGIS_ENGINE_STALE_INTERVALS: ${AEGIS_ENGINE_STALE_INTERVALS:-3}
+      AEGIS_ENGINE_MAX_BACKOFF_SECONDS: ${AEGIS_ENGINE_MAX_BACKOFF_SECONDS:-60}
+      AEGIS_SHUTDOWN_GRACE_SECONDS: ${AEGIS_SHUTDOWN_GRACE_SECONDS:-10}
       PROMETHEUS_URL: http://prometheus:9090
       LOKI_URL: http://loki:3100
       CHECKOUT_URL: http://checkout:8000
@@ -44,6 +53,15 @@ services:
       AEGIS_API_KEY: ${AEGIS_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      AEGIS_REMEDIATION_DRY_RUN: ${AEGIS_REMEDIATION_DRY_RUN:-false}
+      AEGIS_REMEDIATION_MAX_ATTEMPTS: ${AEGIS_REMEDIATION_MAX_ATTEMPTS:-3}
+      AEGIS_REMEDIATION_BACKOFF_MS: ${AEGIS_REMEDIATION_BACKOFF_MS:-500}
+      AEGIS_REMEDIATION_TIMEOUT_SECONDS: ${AEGIS_REMEDIATION_TIMEOUT_SECONDS:-5}
+      AEGIS_REMEDIATION_MAX_PER_WINDOW: ${AEGIS_REMEDIATION_MAX_PER_WINDOW:-5}
+      AEGIS_REMEDIATION_WINDOW_SECONDS: ${AEGIS_REMEDIATION_WINDOW_SECONDS:-300}
+      AEGIS_REMEDIATION_VERIFY_SECONDS: ${AEGIS_REMEDIATION_VERIFY_SECONDS:-180}
+      AEGIS_REMEDIATION_VERIFY_INTERVAL: ${AEGIS_REMEDIATION_VERIFY_INTERVAL:-5}
+      AEGIS_REMEDIATION_ALLOWED_ACTIONS: ${AEGIS_REMEDIATION_ALLOWED_ACTIONS:-checkout:clear_fault,checkout:scale_simulation,inventory:clear_fault,inventory:scale_simulation}
     volumes:
       - aegis-data:/data
       - aegis-logs:/var/log/aegis
@@ -98,7 +116,7 @@ services:
       resources:
         limits:
           memory: 256M
-          cpus: "0.25"
+          cpus: "1.0"
     restart: unless-stopped
     <<: *aegis-hardening
 
@@ -124,7 +142,7 @@ services:
       resources:
         limits:
           memory: 256M
-          cpus: "0.25"
+          cpus: "1.0"
     restart: unless-stopped
     <<: *aegis-hardening
 
@@ -168,7 +186,7 @@ services:
       resources:
         limits:
           memory: 256M
-          cpus: "0.25"
+          cpus: "1.0"
     restart: unless-stopped
     logging: *default-logging
 
@@ -216,7 +234,7 @@ services:
       resources:
         limits:
           memory: 256M
-          cpus: "0.25"
+          cpus: "1.0"
     restart: unless-stopped
     logging: *default-logging
 

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from aegis.breaker import CircuitBreaker
 from aegis.models import (
     Evidence,
     Investigation,
@@ -16,11 +17,12 @@ from aegis.models import (
     Recommendation,
     RemediationAction,
 )
-from aegis.remediation import RemediationExecutor
+from aegis.remediation import RemediationExecutor, no_remediation_reason
+from aegis.selfmetrics import BACKEND_ERRORS
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
 
     from aegis.settings import Settings
     from aegis.telemetry import Telemetry
@@ -34,6 +36,10 @@ LLM_MAX_RETRIES = 1
 LLM_DEADLINE_SECONDS = 60.0
 LLM_MAX_TOOL_ROUNDS = 6
 LLM_MAX_TOOL_CALLS_PER_ROUND = 8
+# After this many consecutive failures the model is skipped (local investigation only) for
+# the cooldown, so a dead or rate-limited API does not cost a full timeout per incident.
+LLM_BREAKER_FAILURES = 3
+LLM_BREAKER_COOLDOWN_SECONDS = 60.0
 PROMPT_MAX_CHARS = 60_000
 PROMPT_EVIDENCE_ITEMS = 5
 TOOL_RESULT_MAX_CHARS = 8_000
@@ -55,10 +61,19 @@ def _clip(text: str, limit: int) -> str:
 class AgentInvestigator:
     """Evidence-first investigator with an optional OpenAI tool-calling loop."""
 
-    def __init__(self, settings: Settings, store: Store, telemetry: Telemetry):
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        telemetry: Telemetry,
+        llm_breaker: CircuitBreaker | None = None,
+    ):
         self.settings = settings
         self.store = store
         self.telemetry = telemetry
+        self.llm_breaker = llm_breaker or CircuitBreaker(
+            "llm", LLM_BREAKER_FAILURES, LLM_BREAKER_COOLDOWN_SECONDS
+        )
 
     def investigate(self, incident_id: str) -> dict[str, Any]:
         """
@@ -78,9 +93,14 @@ class AgentInvestigator:
             raise ValueError("Incident not found")
 
         result: dict[str, Any]
-        if os.getenv("OPENAI_API_KEY"):
+        advisory = no_remediation_reason(incident)
+        if advisory:
+            # Nothing the model could propose is safe, so it is not asked.
+            result = self._advisory_investigation(incident, advisory)
+            result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
+        elif os.getenv("OPENAI_API_KEY"):
             try:
-                result = self._llm_investigation(incident)
+                result = self._guarded_llm_investigation(incident)
                 result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
                 # Reject malformed LLM output before it is stored or proposed for approval.
                 Investigation.model_validate(result)
@@ -103,7 +123,8 @@ class AgentInvestigator:
         updated = self.store.merge_incident(
             incident_id,
             data,
-            status="recommendation_pending",
+            # With nothing to approve the incident goes back to open for an operator.
+            status="recommendation_pending" if result["recommendation"] else "open",
             only_if_status=_REVIEWABLE_STATUSES,
         )
         if updated is None:
@@ -116,6 +137,37 @@ class AgentInvestigator:
             {"citations": result.get("evidence", []), "mode": result["mode"]},
         )
         return result
+
+    def _guarded_llm_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
+        """Call the model unless its circuit breaker is open; report the outcome to the breaker."""
+        if not self.llm_breaker.allow():
+            raise RuntimeError("LLM circuit open: recent calls failed, using local investigation")
+        try:
+            result = self._llm_investigation(incident)
+        except Exception as exc:
+            BACKEND_ERRORS.labels("llm").inc()
+            self.llm_breaker.record_failure(f"{type(exc).__name__}: {exc}")
+            raise
+        self.llm_breaker.record_success()
+        return result
+
+    def _advisory_investigation(self, incident: dict[str, Any], reason: str) -> dict[str, Any]:
+        """An investigation for an incident that has no safe automated fix: findings only."""
+        incident_id = incident["id"]
+        timeline = self._local_tool("get_incident_timeline", {}, incident_id, [])
+        evidence = [
+            Evidence(source="timeline", label=item.get("kind", "event"), detail=item.get("message", ""))
+            for item in timeline[-3:]
+        ]
+        return {
+            "hypothesis": reason,
+            "confidence": "high",
+            "evidence": [e.model_dump() for e in evidence],
+            "recommendation": None,
+            "next_checks": ["Restore the failing component, then confirm the signals return"],
+            "tools_used": ["get_incident_timeline"],
+            "generated_at": utc_now(),
+        }
 
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
         """Perform investigation using local tools without LLM."""
@@ -156,7 +208,7 @@ class AgentInvestigator:
         ]
         evidence.append(Evidence(source="runbook", label=runbook_slug, detail=runbook[:280]))
 
-        hypothesis, confidence, recommendation = self._generate_recommendation(root)
+        hypothesis, confidence, recommendation = self._generate_recommendation(root, self._fired_rules(incident))
 
         return {
             "hypothesis": hypothesis,
@@ -186,7 +238,16 @@ class AgentInvestigator:
             logger.warning("Tool %s failed for %s: %s", name, incident_id, exc)
             return default
 
-    def _generate_recommendation(self, root: str) -> tuple[str, str, Recommendation]:
+    @staticmethod
+    def _fired_rules(incident: dict[str, Any]) -> set[str]:
+        """Names of the alert rules that have fired for the incident, from its evidence."""
+        data = incident["data"]
+        entries = [*data.get("evidence", []), data.get("latest_evidence")]
+        return {entry["rule"] for entry in entries if isinstance(entry, dict) and "rule" in entry}
+
+    def _generate_recommendation(
+        self, root: str, rules: Collection[str] = ()
+    ) -> tuple[str, str, Recommendation]:
         """Generate hypothesis, confidence, and recommendation based on root cause."""
         if root == "dependency:inventory":
             hypothesis = (
@@ -220,10 +281,13 @@ class AgentInvestigator:
             "Checkout is unhealthy; the available telemetry points to an application-level "
             "fault that needs confirmation before broader action."
         )
+        # Errors outrank latency; a latency-only incident must clear the latency fault,
+        # since clearing "errors" would leave it running and the fix could never verify.
+        fault = "errors" if "checkout_error_rate" in rules or "checkout_p95_latency" not in rules else "latency"
         recommendation = Recommendation(
             action=RemediationAction.CLEAR_FAULT,
             target="checkout",
-            parameters={"fault": "errors"},
+            parameters={"fault": fault},
             reason=(
                 "Clear the known demo fault only after an operator confirms the evidence."
             ),

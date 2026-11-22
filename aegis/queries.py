@@ -24,6 +24,11 @@ INVENTORY_DEPENDENCY_ERRORS: Final = (
     'sum(rate(aegis_dependency_errors_total{service="checkout",dependency="inventory"}[2m]))'
 )
 
+# 0 while every checkout target answers its scrape, 1 when one stops. It is inverted so that
+# 0 is the healthy reading, like the other alert signals, and it is absent only when
+# Prometheus has no checkout target at all.
+CHECKOUT_DOWN: Final = '1 - min(up{job="checkout"})'
+
 CHECKOUT_CPU_BURN: Final = 'aegis_cpu_burn_active{service="checkout"}'
 
 CHECKOUT_REQUESTS_30M: Final = (

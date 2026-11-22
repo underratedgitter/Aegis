@@ -164,3 +164,41 @@ class TestCorsOrigins:
         monkeypatch.setenv("AEGIS_CORS_ORIGINS", value)
         with pytest.raises(SettingsError, match="AEGIS_CORS_ORIGINS"):
             Settings()
+
+
+class TestEngineSupervisionSettings:
+    DEFAULTS = (
+        ("AEGIS_CYCLE_TIMEOUT_SECONDS", "cycle_timeout_seconds", 60),
+        ("AEGIS_ENGINE_STALE_INTERVALS", "engine_stale_intervals", 3),
+        ("AEGIS_ENGINE_MAX_BACKOFF_SECONDS", "engine_max_backoff_seconds", 60),
+        ("AEGIS_SHUTDOWN_GRACE_SECONDS", "shutdown_grace_seconds", 10),
+    )
+
+    @pytest.mark.parametrize(("name", "attribute", "default"), DEFAULTS)
+    def test_defaults_and_overrides(self, monkeypatch, name, attribute, default):
+        monkeypatch.delenv(name, raising=False)
+        assert getattr(Settings(), attribute) == default
+        monkeypatch.setenv(name, "7")
+        assert getattr(Settings(), attribute) == 7
+
+    @pytest.mark.parametrize(("name", "attribute", "default"), DEFAULTS)
+    def test_malformed_values_name_the_variable(self, monkeypatch, name, attribute, default):
+        monkeypatch.setenv(name, "soon")
+        with pytest.raises(SettingsError, match=f"{name} must be an integer, got 'soon'"):
+            Settings()
+
+    @pytest.mark.parametrize(
+        "name",
+        ["AEGIS_CYCLE_TIMEOUT_SECONDS", "AEGIS_ENGINE_STALE_INTERVALS", "AEGIS_ENGINE_MAX_BACKOFF_SECONDS"],
+    )
+    def test_zero_is_rejected(self, monkeypatch, name):
+        monkeypatch.setenv(name, "0")
+        with pytest.raises(SettingsError, match=f"{name} must be at least 1"):
+            Settings()
+
+    def test_shutdown_grace_may_be_zero_but_must_fit_the_stop_timeout(self, monkeypatch):
+        monkeypatch.setenv("AEGIS_SHUTDOWN_GRACE_SECONDS", "0")
+        assert Settings().shutdown_grace_seconds == 0
+        monkeypatch.setenv("AEGIS_SHUTDOWN_GRACE_SECONDS", "16")
+        with pytest.raises(SettingsError, match="AEGIS_SHUTDOWN_GRACE_SECONDS must be at most 15"):
+            Settings()

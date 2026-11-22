@@ -127,7 +127,9 @@ def test_the_engine_does_not_spam_the_timeline(tmp_path, clock):
         def prometheus_query(self, query):
             return {"value": 0.5 if query == CHECKOUT_ERROR_RATE else 0.0}
 
-    config = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    config = Settings(
+        db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks", detection_cycles=1
+    )
     store = _store(tmp_path)
     engine = IncidentEngine(config, store, Telemetry())
     engine._investigate = lambda incident_id: None
