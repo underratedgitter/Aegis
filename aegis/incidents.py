@@ -179,7 +179,7 @@ class IncidentEngine:
         try:
             stuck = [
                 incident["id"]
-                for incident in self.store.list_incidents(limit=1000)
+                for incident in self.store.active_incidents()
                 if incident["status"] == "investigating"
             ]
         except Exception:
@@ -485,12 +485,8 @@ class IncidentEngine:
         signal could not be read this cycle (``unverified_roots``) neither
         accumulates misses nor resolves, so a Prometheus outage cannot close it.
         """
-        active = self.store.list_incidents()
-        active_ids = {
-            incident["id"]
-            for incident in active
-            if incident["status"] not in {"resolved", "closed"}
-        }
+        active = self.store.active_incidents()
+        active_ids = {incident["id"] for incident in active}
 
         degraded = {
             incident["id"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import sqlite3
 import threading
 import time
@@ -52,12 +53,12 @@ from aegis.models import (
 from aegis.remediation import RemediationError, RemediationExecutor, no_remediation_reason
 from aegis.selfmetrics import ControlPlaneCollector
 from aegis.settings import Settings
-from aegis.storage import Store, utc_now
+from aegis.storage import CLOSED_STATUSES, Store, utc_now
 from aegis.supervisor import EngineStatus, SupervisedEngine
 from aegis.telemetry import Telemetry
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 logger = configure_logging("aegis-control-plane")
 settings = Settings()
@@ -327,15 +328,16 @@ def prometheus_metrics() -> Response:
 
 @app.get("/api/overview", response_model=OverviewResponse)
 def overview() -> OverviewResponse:
-    incidents = store.list_incidents()
+    recent, _ = store.query_incidents(limit=12)
+    counts = store.incident_status_counts()
+    total = sum(counts.values())
     durations = store.resolved_durations()
-    investigated = sum(bool(item["data"].get("investigation")) for item in incidents)
     return OverviewResponse(
-        incidents=incidents[:12],
-        open_incidents=sum(item["status"] not in {"resolved", "closed"} for item in incidents),
+        incidents=recent,
+        open_incidents=sum(n for status, n in counts.items() if status not in CLOSED_STATUSES),
         mttr_seconds=round(mean(durations), 2) if durations else None,
         resolved_incidents=len(durations),
-        agent_assisted_rate=round(investigated / len(incidents), 2) if incidents else None,
+        agent_assisted_rate=round(store.investigated_count() / total, 2) if total else None,
         slos=[telemetry.slo_snapshot().model_dump()],
         services=[_service_status("checkout", settings.checkout_url), _service_status("inventory", settings.inventory_url)],
         telemetry={"prometheus": _prometheus_status(), "loki": telemetry.loki_status()},
@@ -344,42 +346,30 @@ def overview() -> OverviewResponse:
 
 # ─── Incidents (list, export, and batch BEFORE /{id} routes) ──────────────────
 
+CSV_CHUNK_BYTES = 64 * 1024
+
 @app.get("/api/incidents")
 def list_incidents(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200), status: str | None = Query(None, max_length=64), severity: str | None = Query(None, max_length=64), search: str | None = Query(None, max_length=200)) -> dict[str, Any]:
-    all_incidents = store.list_incidents(limit=500)
-    if status:
-        all_incidents = [i for i in all_incidents if i["status"] == status]
-    if severity:
-        all_incidents = [i for i in all_incidents if i["severity"] == severity]
-    if search:
-        sl = search.lower()
-        all_incidents = [i for i in all_incidents if sl in i["title"].lower() or sl in i["root_cause_key"].lower()]
-    total = len(all_incidents)
-    start = (page - 1) * limit
-    return {"incidents": all_incidents[start:start + limit], "pagination": {"page": page, "limit": limit, "total": total, "pages": (total + limit - 1) // limit}}
+    """One page of incident summaries (no evidence history); GET /api/incidents/{id} has the rest."""
+    incidents, total = store.query_incidents(
+        status=status, severity=severity, search=search, offset=(page - 1) * limit, limit=limit
+    )
+    return {"incidents": incidents, "pagination": {"page": page, "limit": limit, "total": total, "pages": (total + limit - 1) // limit}}
 
 
 @app.get("/api/incidents/export")
 def export_incidents(
     export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
 ) -> Any:
-    incidents = store.list_incidents(limit=1000)
+    """Every incident, streamed in batches so a large history is never held in memory."""
     if export_format == "csv":
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "status", "root_cause_key", "first_seen", "last_seen", "resolved_at"])
-        writer.writeheader()
-        for inc in incidents:
-            writer.writerow({k: inc.get(k, "") for k in writer.fieldnames})
-        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=incidents.csv"})
-    return {"incidents": incidents, "exported_at": utc_now(), "count": len(incidents)}
+        return StreamingResponse(_incidents_csv(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=incidents.csv"})
+    return StreamingResponse(_incidents_json(), media_type="application/json")
 
 
 @app.post("/api/incidents/batch/approve", dependencies=PROTECTED)
 def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
-    # list_incidents sorts open/investigating first, so the default page of 50
-    # could hide pending recommendations behind a burst of new incidents.
-    incidents = store.list_incidents(limit=1000)
-    pending = [i for i in incidents if i["status"] == "recommendation_pending"]
+    pending = [i for i in store.active_incidents() if i["status"] == "recommendation_pending"]
     approved = []
     for inc in pending:
         rec = inc["data"].get("recommendation") or {}
@@ -574,6 +564,31 @@ def run_engine_once() -> dict[str, Any]:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+CSV_COLUMNS = ["id", "title", "severity", "status", "root_cause_key", "first_seen", "last_seen", "resolved_at"]
+
+
+def _incidents_csv() -> Iterator[str]:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS)
+    writer.writeheader()
+    for incident in store.iter_incidents():
+        writer.writerow({column: incident.get(column) or "" for column in CSV_COLUMNS})
+        if buffer.tell() > CSV_CHUNK_BYTES:
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate()
+    yield buffer.getvalue()
+
+
+def _incidents_json() -> Iterator[str]:
+    count = 0
+    yield '{"incidents": ['
+    for incident in store.iter_incidents():
+        yield ("," if count else "") + json.dumps(incident)
+        count += 1
+    yield f'], "exported_at": {json.dumps(utc_now())}, "count": {count}}}'
+
 
 def _incident_with_events(incident_id: str) -> dict[str, Any]:
     incident = store.get_incident(incident_id)

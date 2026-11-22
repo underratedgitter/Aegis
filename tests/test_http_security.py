@@ -68,7 +68,7 @@ class TestSecurityHeaders:
         def boom(*_args, **_kwargs):
             raise RuntimeError("secret internal detail")
 
-        monkeypatch.setattr(control_plane.store, "list_incidents", boom)
+        monkeypatch.setattr(control_plane.store, "query_incidents", boom)
         response = TestClient(control_plane.app, raise_server_exceptions=False).get("/api/incidents")
         assert response.status_code == 500
         assert response.json() == {"detail": "Internal server error."}

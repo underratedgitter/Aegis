@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from aegis.models import ExecutionState, Severity
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterator
 
 BUSY_TIMEOUT_MS = 10_000
 # Recent detected/signal events inspected when deciding whether another one is due.
@@ -78,8 +78,27 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX audit_log_action_idx ON audit_log(action, id)",
         "CREATE INDEX audit_log_incident_idx ON audit_log(incident_id, id)",
     ),
+    # 3: incident listing and the engine's active-incident scan filter on status, newest first.
+    ("CREATE INDEX incidents_status_last_seen_idx ON incidents(status, last_seen)",),
 )
 
+
+CLOSED_STATUSES = ("resolved", "closed")
+# Open work first, finished incidents last, newest first within a status.
+_STATUS_ORDER = (
+    "ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'investigating' THEN 1 "
+    "WHEN 'recommendation_pending' THEN 2 WHEN 'approved' THEN 3 WHEN 'executing' THEN 3 "
+    "ELSE 4 END, last_seen DESC"
+)
+# What an incident list row needs from the stored data: the remediation's verification
+# state and the runbooks the investigation cited. The evidence history stays in the row.
+_SUMMARY_COLUMNS = (
+    "id, title, severity, status, root_cause_key, first_seen, last_seen, resolved_at, "
+    "json_extract(data_json, '$.remediation.verification.state') AS verification_state, "
+    "(SELECT json_group_array(DISTINCT json_extract(e.value, '$.label')) "
+    "FROM json_each(incidents.data_json, '$.investigation.evidence') AS e "
+    "WHERE json_extract(e.value, '$.source') = 'runbook') AS runbooks"
+)
 
 SEVERITY_RANK = {severity.value: rank for rank, severity in enumerate(Severity)}
 
@@ -177,6 +196,103 @@ class Store:
                 (limit,),
             ).fetchall()
             return self._rows(rows)
+
+    def query_incidents(
+        self,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+        search: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One page of incident summaries and how many incidents match the filters.
+
+        `search` is a case-insensitive substring of the title or root-cause key. Rows
+        carry the summary fields only; `data` holds just the remediation verification
+        state and the runbooks cited, so listing does not read every incident's evidence
+        history. Use `get_incident` for the whole record.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if search:
+            escaped = search.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append(
+                "(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(root_cause_key) LIKE ? ESCAPE '\\')"
+            )
+            params.extend([f"%{escaped}%"] * 2)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) FROM incidents {where}", params
+            ).fetchone()[0]
+            rows = self.db.execute(
+                f"SELECT {_SUMMARY_COLUMNS} FROM incidents {where} {_STATUS_ORDER} LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._summary(row) for row in rows], total
+
+    @staticmethod
+    def _summary(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        state = result.pop("verification_state")
+        labels = json.loads(result.pop("runbooks") or "[]")
+        data: dict[str, Any] = {}
+        if state is not None:
+            data["remediation"] = {"verification": {"state": state}}
+        if labels:
+            data["investigation"] = {
+                "evidence": [{"source": "runbook", "label": label} for label in labels]
+            }
+        result["data"] = data
+        return result
+
+    def active_incidents(self) -> list[dict[str, Any]]:
+        """Every incident that is not resolved or closed, with no row limit."""
+        marks = ",".join("?" * len(CLOSED_STATUSES))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT * FROM incidents WHERE status NOT IN ({marks}) {_STATUS_ORDER}",
+                CLOSED_STATUSES,
+            ).fetchall()
+            return self._rows(rows)
+
+    def iter_incidents(self, batch_size: int = 200) -> Iterator[dict[str, Any]]:
+        """Every incident, oldest first, read in batches so an export never loads the table.
+
+        The store lock is held per batch, not across the iteration, so a slow consumer
+        does not block the engine.
+        """
+        last_rowid = 0
+        while True:
+            with self.lock:
+                rows = self.db.execute(
+                    "SELECT rowid AS _rowid, * FROM incidents WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch_size),
+                ).fetchall()
+                batch = self._rows(rows)
+            if not rows:
+                return
+            last_rowid = rows[-1]["_rowid"]
+            for incident in batch:
+                incident.pop("_rowid", None)
+                yield incident
+
+    def investigated_count(self) -> int:
+        """Number of incidents the agent has investigated."""
+        with self.lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM incidents "
+                    "WHERE json_type(data_json, '$.investigation') IS NOT NULL"
+                ).fetchone()[0]
+            )
 
     def get_incident(self, incident_id: str) -> dict[str, Any] | None:
         """Get a single incident by ID."""

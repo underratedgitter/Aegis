@@ -177,9 +177,12 @@ curl http://localhost:8000/api/overview
 curl -X POST http://localhost:8000/api/engine/run-once \
   -H "Authorization: Bearer $AEGIS_API_KEY"
 
-# Inspect incidents (filters: status, severity, search, page, limit)
+# Inspect incidents (filters: status, severity, search, page, limit). The list is filtered,
+# counted and paged in SQL over the whole history and returns summaries: the evidence
+# history is only in the single-incident response.
 curl http://localhost:8000/api/incidents
 curl http://localhost:8000/api/incidents/<incident-id>
+# The export streams every incident (full records for json, summary columns for csv), oldest first
 curl 'http://localhost:8000/api/incidents/export?format=csv'
 
 # Trigger investigation manually
