@@ -7,7 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from aegis.breaker import BreakerStatus  # noqa: TC001 - pydantic resolves the field type at runtime
 from aegis.incidents import IncidentEngine
@@ -48,6 +48,8 @@ class EngineStatus(BaseModel):
     last_cycle_seconds: float | None = None
     last_error: str | None = None
     last_error_at: str | None = None
+    # Latest state of every alert signal: ok, breaching or unavailable (detection's view).
+    signals: dict[str, str] = Field(default_factory=dict)
     consecutive_failures: int
     cycles_total: int
     failures_total: int
@@ -210,6 +212,7 @@ class SupervisedEngine(IncidentEngine):
         settings = self.settings
         stale_after = settings.engine_stale_intervals * settings.poll_seconds + settings.cycle_timeout_seconds
         running = self.is_running
+        signals = self.signal_states
         with self._health_lock:
             reference = self._last_success_at if self._last_success_at is not None else self._started_at
             age = None if reference is None else time.monotonic() - reference
@@ -224,6 +227,10 @@ class SupervisedEngine(IncidentEngine):
             elif failures:
                 state = "degraded"
                 reason = f"{failures} consecutive cycle failure{'s' if failures != 1 else ''}"
+            elif blind := sorted(name for name, value in signals.items() if value == "unavailable"):
+                # The loop is healthy but cannot see: its checks say nothing about the service.
+                state = "degraded"
+                reason = f"signals unavailable: {', '.join(blind)}"
             success_age = (
                 None
                 if self._last_success_at is None
@@ -241,6 +248,7 @@ class SupervisedEngine(IncidentEngine):
                 last_cycle_seconds=self._last_cycle_seconds,
                 last_error=self._last_error,
                 last_error_at=self._last_error_iso,
+                signals=signals,
                 consecutive_failures=failures,
                 cycles_total=self._cycles_total,
                 failures_total=self._failures_total,

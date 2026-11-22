@@ -17,7 +17,7 @@ from aegis.models import (
     Recommendation,
     RemediationAction,
 )
-from aegis.remediation import RemediationExecutor
+from aegis.remediation import RemediationExecutor, no_remediation_reason
 from aegis.selfmetrics import BACKEND_ERRORS
 from aegis.storage import Store, utc_now
 
@@ -93,7 +93,12 @@ class AgentInvestigator:
             raise ValueError("Incident not found")
 
         result: dict[str, Any]
-        if os.getenv("OPENAI_API_KEY"):
+        advisory = no_remediation_reason(incident)
+        if advisory:
+            # Nothing the model could propose is safe, so it is not asked.
+            result = self._advisory_investigation(incident, advisory)
+            result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
+        elif os.getenv("OPENAI_API_KEY"):
             try:
                 result = self._guarded_llm_investigation(incident)
                 result["mode"] = InvestigationMode.LLM_TOOL_CALLING.value
@@ -118,7 +123,8 @@ class AgentInvestigator:
         updated = self.store.merge_incident(
             incident_id,
             data,
-            status="recommendation_pending",
+            # With nothing to approve the incident goes back to open for an operator.
+            status="recommendation_pending" if result["recommendation"] else "open",
             only_if_status=_REVIEWABLE_STATUSES,
         )
         if updated is None:
@@ -144,6 +150,24 @@ class AgentInvestigator:
             raise
         self.llm_breaker.record_success()
         return result
+
+    def _advisory_investigation(self, incident: dict[str, Any], reason: str) -> dict[str, Any]:
+        """An investigation for an incident that has no safe automated fix: findings only."""
+        incident_id = incident["id"]
+        timeline = self._local_tool("get_incident_timeline", {}, incident_id, [])
+        evidence = [
+            Evidence(source="timeline", label=item.get("kind", "event"), detail=item.get("message", ""))
+            for item in timeline[-3:]
+        ]
+        return {
+            "hypothesis": reason,
+            "confidence": "high",
+            "evidence": [e.model_dump() for e in evidence],
+            "recommendation": None,
+            "next_checks": ["Restore the failing component, then confirm the signals return"],
+            "tools_used": ["get_incident_timeline"],
+            "generated_at": utc_now(),
+        }
 
     def _local_investigation(self, incident: dict[str, Any]) -> dict[str, Any]:
         """Perform investigation using local tools without LLM."""

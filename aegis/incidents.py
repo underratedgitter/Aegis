@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from aegis.agent import AgentInvestigator
 from aegis.anomaly import RollingZScoreDetector
-from aegis.models import AlertRule, Severity
+from aegis.models import BLIND_ROOT, LIVENESS_RULE, AlertRule, Severity
 from aegis.queries import (
     CHECKOUT_CPU_BURN,
     CHECKOUT_DOWN,
@@ -36,9 +36,6 @@ SHUTDOWN_JOIN_SECONDS = 15.0
 
 # How many incidents to scan for a recently resolved one to reopen.
 RECENT_INCIDENT_LOOKBACK = 1000
-
-# Root cause under which prolonged blindness is recorded.
-BLIND_ROOT = "telemetry:blind"
 
 # Fraction of the dependency threshold below which checkout symptoms stop being
 # attributed to an already-open dependency incident.
@@ -104,9 +101,8 @@ RULES = (
 
 RULES_BY_NAME = {rule.name: rule for rule in RULES}
 
-# The rule whose reading says whether the checkout target is alive, which decides
+# LIVENESS_RULE (models.py) reads whether the checkout target is alive, which decides
 # whether an empty result from the others means "quiet" or "unknown".
-LIVENESS_RULE = "checkout_down"
 INVENTORY_DEPENDENCY_RULE = "inventory_dependency_errors"
 DEPENDENCY_ROOT = "dependency:inventory"
 DEPENDENCY_SYMPTOMS = frozenset({"checkout_error_rate", "checkout_p95_latency"})

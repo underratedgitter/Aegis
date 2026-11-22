@@ -143,6 +143,8 @@ class TestControlPlaneReadiness:
             control_plane.telemetry, "loki_status", lambda: control_plane.TelemetryStatus(available=True)
         )
         monkeypatch.setattr(type(control_plane.engine), "is_running", True)
+        # Signal states left by tests that ran the shared engine against no Prometheus.
+        monkeypatch.setattr(control_plane.engine, "_signal_states", {})
         return TestClient(control_plane.app)
 
     def test_ready_when_everything_is_up(self, client):

@@ -32,6 +32,9 @@ BACKEND_ERRORS = Counter(
 EXECUTION_EVENTS = {
     "remediation_executed": "executed",
     "remediation_failed": "failed",
+    "remediation_dry_run": "dry_run",
+    "remediation_verified": "verified",
+    "remediation_escalated": "escalated",
 }
 CLOSED_STATUSES = ("resolved", "closed")
 

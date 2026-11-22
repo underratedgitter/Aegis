@@ -862,6 +862,9 @@ function engineRows(engine) {
     healthRow("Consecutive failures", engine.consecutive_failures === 0, `${engine.failures_total} failed of ${engine.cycles_total} cycles`, String(engine.consecutive_failures)),
     healthRow("Last error", !engine.consecutive_failures, engine.last_error_at ? fmtClock(engine.last_error_at) : "never", engine.last_error ?? "none"),
   ];
+  for (const [name, signal] of Object.entries(engine.signals ?? {})) {
+    rows.push(healthRow(`signal ${name}`, signal === "ok" ? true : signal === "breaching" ? false : "warn", signal === "unavailable" ? "cannot be read, so it is not treated as healthy" : "alert signal", pretty(signal)));
+  }
   for (const [name, breaker] of Object.entries(engine.breakers)) {
     const wait = breaker.retry_in_seconds ? `, retry in ${Math.round(breaker.retry_in_seconds)}s` : "";
     rows.push(healthRow(`${name} circuit`, breaker.state === "closed" ? true : breaker.state === "half_open" ? "warn" : false, `circuit breaker${wait}`, pretty(breaker.state)));

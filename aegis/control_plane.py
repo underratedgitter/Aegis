@@ -48,7 +48,7 @@ from aegis.models import (
     ServiceStatus,
     TelemetryStatus,
 )
-from aegis.remediation import RemediationError, RemediationExecutor
+from aegis.remediation import RemediationError, RemediationExecutor, no_remediation_reason
 from aegis.selfmetrics import ControlPlaneCollector
 from aegis.settings import Settings
 from aegis.storage import Store, utc_now
@@ -407,6 +407,8 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         raise HTTPException(status_code=404, detail="Incident not found")
     if incident["status"] != "recommendation_pending":
         raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
+    if reason := no_remediation_reason(incident):
+        raise HTTPException(status_code=409, detail=reason)
     recommendation = incident["data"].get("recommendation") or {}
     try:
         remediation.ensure_permitted(recommendation)

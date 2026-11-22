@@ -50,6 +50,13 @@ class InvestigationMode(StrEnum):
     LLM_TOOL_CALLING = "llm_tool_calling"
 
 
+# Incident vocabulary shared by detection (which raises these) and remediation (which refuses them).
+# Root cause under which prolonged telemetry blindness is recorded.
+BLIND_ROOT = "telemetry:blind"
+# The rule whose reading says whether the checkout target answers scrapes at all.
+LIVENESS_RULE = "checkout_down"
+
+
 class RemediationAction(StrEnum):
     CLEAR_FAULT = "clear_fault"
     SCALE_SIMULATION = "scale_simulation"
@@ -75,7 +82,8 @@ class Investigation(BaseModel):
     hypothesis: str
     confidence: str = Field(pattern="^(low|medium|high)$")
     evidence: list[Evidence] = Field(default_factory=list)
-    recommendation: Recommendation
+    # None when no safe automated action exists (telemetry blind, checkout not answering).
+    recommendation: Recommendation | None = None
     next_checks: list[str] = Field(default_factory=list)
     tools_used: list[str] = Field(default_factory=list)
     generated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())

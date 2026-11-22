@@ -94,6 +94,11 @@ class TestEngineHealthDisplay:
         assert 'setHtml("set-engine-status"' in APP_JS
         assert "circuit" in APP_JS
 
+    def test_settings_health_panel_lists_each_alert_signal_state(self):
+        body = APP_JS.split("function engineRows(engine)")[1].split("\n}\n")[0]
+        assert "engine.signals" in body
+        assert "unavailable" in body
+
     def test_a_failed_engine_read_never_marks_the_control_plane_disconnected(self):
         body = APP_JS.split("async function loadEngineStatus()")[1].split("\n}\n")[0]
         assert "setConnection" not in body

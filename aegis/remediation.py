@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import httpx
 
 from aegis.auth import bearer_header
-from aegis.models import ExecutionState, RemediationAction, VerificationState
+from aegis.models import (
+    BLIND_ROOT,
+    LIVENESS_RULE,
+    ExecutionState,
+    RemediationAction,
+    VerificationState,
+)
 from aegis.storage import Store, utc_now
 
 if TYPE_CHECKING:
@@ -30,6 +36,21 @@ ADMIN_CONNECT_TIMEOUT_SECONDS = 2.0
 BACKOFF_CAP_SECONDS = 10.0
 SHUTDOWN_JOIN_SECONDS = 15.0
 MAY_HAVE_APPLIED = "may have been applied"
+
+
+def no_remediation_reason(incident: dict[str, Any]) -> str | None:
+    """Why no automated fix may be offered or run for this incident, or None when one may.
+
+    Clearing a fault or scaling a service cannot help when Aegis itself is blind, or when
+    the checkout target is not answering at all: the admin call would fail or, worse, look
+    like it fixed something. Those incidents are for an operator.
+    """
+    if incident["root_cause_key"] == BLIND_ROOT:
+        return "Aegis cannot read its telemetry; there is no remediation to run, restore the telemetry first"
+    latest = incident["data"].get("latest_evidence")
+    if isinstance(latest, dict) and latest.get("rule") == LIVENESS_RULE:
+        return "Checkout is not answering metric scrapes; its admin API cannot be relied on, an operator must restore it"
+    return None
 
 
 class RemediationError(ValueError):
@@ -184,6 +205,8 @@ class RemediationExecutor:
                 raise RemediationError("Remediation is already executing")
             raise RemediationError("Remediation requires an approved recommendation")
 
+        if reason := no_remediation_reason(incident):
+            raise RemediationError(reason)
         action, target = self.ensure_permitted(recommendation)
 
         if not self.settings.api_key.strip():
@@ -608,19 +631,30 @@ class RemediationExecutor:
             if isinstance(entry, dict) and entry.get("rule") in rules
         )
         readings: list[dict[str, Any]] = []
+        quiet: bool | None = None
         for name in names:
             rule = rules[name]
             result = self.telemetry.prometheus_query(rule.query)
-            error = result.get("error")
-            readings.append(
-                {
-                    "rule": name,
-                    "value": result.get("value"),
-                    "threshold": rule.threshold,
-                    "clear": None if error else not rule.fires(result.get("value")),
-                }
-            )
+            value = result.get("value")
+            clear: bool | None
+            if result.get("error"):
+                clear = None
+            elif value is None:
+                # Same meaning as in detection: an empty result is quiet only while checkout
+                # still answers scrapes; otherwise it is missing data, which proves nothing.
+                if quiet is None:
+                    quiet = self._checkout_answers_scrapes(rules[LIVENESS_RULE])
+                clear = True if quiet and name != LIVENESS_RULE else None
+            else:
+                clear = not rule.fires(value)
+            readings.append({"rule": name, "value": value, "threshold": rule.threshold, "clear": clear})
         return readings
+
+    def _checkout_answers_scrapes(self, rule: Any) -> bool:
+        assert self.telemetry is not None
+        result = self.telemetry.prometheus_query(rule.query)
+        value = result.get("value")
+        return not result.get("error") and value is not None and not rule.fires(value)
 
     @staticmethod
     def _signals_clear(readings: list[dict[str, Any]]) -> bool | None:
