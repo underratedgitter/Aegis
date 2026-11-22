@@ -337,6 +337,24 @@ class Store:
                 result.append(item)
             return result
 
+    def incident_status_counts(self) -> dict[str, int]:
+        """Number of incidents in each status."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT status, COUNT(*) AS n FROM incidents GROUP BY status"
+            ).fetchall()
+        return {row["status"]: row["n"] for row in rows}
+
+    def event_counts(self, kinds: Collection[str]) -> dict[str, int]:
+        """Number of timeline events of each of the given kinds, across all incidents."""
+        marks = ",".join("?" * len(kinds))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT kind, COUNT(*) AS n FROM events WHERE kind IN ({marks}) GROUP BY kind",
+                tuple(kinds),
+            ).fetchall()
+        return {row["kind"]: row["n"] for row in rows}
+
     def resolved_durations(self) -> list[float]:
         """Get durations (in seconds) for all resolved incidents."""
         with self.lock:

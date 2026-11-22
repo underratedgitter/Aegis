@@ -289,3 +289,51 @@ def test_runbook_read_is_size_capped_and_tolerates_bad_bytes(tmp_path, monkeypat
     text = agent._read_runbook("big")
 
     assert len(text) == agent_module.RUNBOOK_MAX_CHARS
+
+
+def test_llm_breaker_opens_after_repeated_failures_and_skips_the_model(tmp_path, llm):
+    llm.script = [ConnectionError("down")]
+    agent, store, _ = _setup(tmp_path)
+
+    for _ in range(agent_module.LLM_BREAKER_FAILURES):
+        assert agent.investigate("inc-1")["mode"] == "local_fallback"
+    requests_before = len(llm.requests)
+
+    result = agent.investigate("inc-1")
+
+    assert len(llm.requests) == requests_before
+    assert result["mode"] == "local_fallback"
+    assert "circuit open" in result["fallback_reason"]
+    assert agent.llm_breaker.snapshot().state == "open"
+    assert store.get_incident("inc-1")["status"] == "recommendation_pending"
+
+
+def test_llm_breaker_probes_after_the_cooldown_and_closes_on_success(tmp_path, llm, monkeypatch):
+    clock = {"t": 500.0}
+    monkeypatch.setattr("aegis.breaker.time.monotonic", lambda: clock["t"])
+    llm.script = [ConnectionError("down")]
+    agent, _, _ = _setup(tmp_path)
+    for _ in range(agent_module.LLM_BREAKER_FAILURES):
+        agent.investigate("inc-1")
+
+    clock["t"] += agent_module.LLM_BREAKER_COOLDOWN_SECONDS
+    llm.script = [_response(json.dumps(VALID_ANSWER))]
+    result = agent.investigate("inc-1")
+
+    assert result["mode"] == "llm_tool_calling"
+    assert agent.llm_breaker.snapshot().state == "closed"
+
+
+def test_llm_failures_are_counted_as_backend_errors(tmp_path, llm):
+    from prometheus_client import REGISTRY
+
+    def count():
+        return REGISTRY.get_sample_value("aegis_backend_errors_total", {"backend": "llm"}) or 0.0
+
+    llm.script = [ConnectionError("down")]
+    agent, _, _ = _setup(tmp_path)
+    before = count()
+
+    agent.investigate("inc-1")
+
+    assert count() == before + 1

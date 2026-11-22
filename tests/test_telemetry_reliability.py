@@ -149,3 +149,60 @@ def test_loki_status_never_raises_and_is_not_retried(telemetry, monkeypatch):
 
     assert status.available is False
     assert get.calls == 1
+
+
+def _errors(backend):
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value("aegis_backend_errors_total", {"backend": backend}) or 0.0
+
+
+def test_loki_fails_fast_while_its_breaker_is_open_then_recovers(telemetry, clock, monkeypatch):
+    get = Scripted(httpx.ConnectError("refused"))
+    monkeypatch.setattr(telemetry._client, "get", get)
+    assert telemetry.loki_status().available is False
+    calls_after_first = get.calls
+
+    status = telemetry.loki_status()
+
+    assert get.calls == calls_after_first
+    assert status.available is False
+    assert "unavailable" in status.error
+    assert telemetry.loki_breaker.snapshot().state == "open"
+
+    clock.now += telemetry_module.BREAKER_COOLDOWN_SECONDS + 1
+    get.outcomes = [httpx.Response(200, request=httpx.Request("GET", "http://loki/ready"))]
+    assert telemetry.loki_status().available is True
+    assert telemetry.loki_breaker.snapshot().state == "closed"
+
+
+def test_loki_server_errors_trip_the_breaker_but_not_a_plain_404(telemetry, clock, monkeypatch):
+    request = httpx.Request("GET", "http://loki/ready")
+    monkeypatch.setattr(telemetry._client, "get", Scripted(httpx.Response(404, request=request)))
+    telemetry.loki_status()
+    assert telemetry.loki_breaker.snapshot().state == "closed"
+
+    monkeypatch.setattr(telemetry._client, "get", Scripted(httpx.Response(503, request=request)))
+    telemetry.loki_status()
+    assert telemetry.loki_breaker.snapshot().state == "open"
+
+
+def test_backend_errors_are_counted_per_backend(telemetry, clock, monkeypatch):
+    prom_before, loki_before = _errors("prometheus"), _errors("loki")
+    monkeypatch.setattr(telemetry._client, "get", Scripted(httpx.ConnectError("refused")))
+
+    telemetry.prometheus_query("up")
+    telemetry.loki_status()
+
+    assert _errors("prometheus") == prom_before + 1
+    assert _errors("loki") == loki_before + 1
+
+
+def test_a_rejected_call_is_not_counted_as_a_backend_error(telemetry, clock, monkeypatch):
+    monkeypatch.setattr(telemetry._client, "get", Scripted(httpx.ConnectError("refused")))
+    telemetry.prometheus_query("up")
+    before = _errors("prometheus")
+
+    telemetry.prometheus_query("up")
+
+    assert _errors("prometheus") == before
