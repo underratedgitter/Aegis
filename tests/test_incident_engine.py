@@ -29,7 +29,9 @@ class FakeTelemetry:
 
 
 def test_engine_correlates_symptoms_and_waits_for_two_healthy_cycles(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    settings = Settings(
+        db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks", detection_cycles=1
+    )
     store = Store(settings.db_path)
     telemetry = FakeTelemetry()
     engine = IncidentEngine(settings, store, telemetry)
@@ -52,7 +54,12 @@ def test_engine_correlates_symptoms_and_waits_for_two_healthy_cycles(tmp_path):
 
 
 def test_engine_can_open_the_same_root_cause_again_after_resolution(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    settings = Settings(
+        db_path=str(tmp_path / "db.sqlite"),
+        runbook_dir="runbooks",
+        detection_cycles=1,
+        reopen_cooldown_seconds=0,
+    )
     store = Store(settings.db_path)
     telemetry = FakeTelemetry()
     engine = IncidentEngine(settings, store, telemetry)
@@ -136,7 +143,9 @@ def test_remediated_incident_gets_a_fresh_resolution_window(tmp_path):
 
 def test_incident_evidence_is_json_safe_when_the_baseline_was_flat(tmp_path):
     """A flat baseline gives an infinite z-score, which must not reach the API as Infinity."""
-    settings = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks")
+    settings = Settings(
+        db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks", detection_cycles=1
+    )
     store = Store(settings.db_path)
     telemetry = FakeTelemetry()
     engine = IncidentEngine(settings, store, telemetry)
