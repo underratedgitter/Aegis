@@ -119,6 +119,8 @@ class Settings:
     max_evidence_history: int = _env_int("AEGIS_MAX_EVIDENCE", 100)
     resolution_cycles: int = _env_int("AEGIS_RESOLUTION_CYCLES", 2)
     signal_event_interval: int = _env_int("AEGIS_SIGNAL_EVENT_INTERVAL", 60)
+    # Resolved incidents (with their events and executions) older than this many days are pruned; 0 keeps all.
+    retention_days: int = _env_int("AEGIS_RETENTION_DAYS", 30)
     # Supervision: a cycle longer than the timeout is abandoned and counted as a failure;
     # no success for stale_intervals polls (plus one cycle timeout) marks the engine stalled.
     cycle_timeout_seconds: int = _env_int("AEGIS_CYCLE_TIMEOUT_SECONDS", 60)
@@ -167,6 +169,7 @@ class Settings:
             "AEGIS_MAX_EVIDENCE": ("max_evidence_history", 1),
             "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", 1),
             "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", 0),
+            "AEGIS_RETENTION_DAYS": ("retention_days", 0),
             "AEGIS_CYCLE_TIMEOUT_SECONDS": ("cycle_timeout_seconds", 1),
             "AEGIS_ENGINE_STALE_INTERVALS": ("engine_stale_intervals", 1),
             "AEGIS_ENGINE_MAX_BACKOFF_SECONDS": ("engine_max_backoff_seconds", 1),

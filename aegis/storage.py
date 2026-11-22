@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterator
 
 BUSY_TIMEOUT_MS = 10_000
+# Events returned for an incident unless the caller asks for another page size.
+DEFAULT_EVENT_LIMIT = 100
 # Recent detected/signal events inspected when deciding whether another one is due.
 SIGNAL_LOOKBACK = 200
 
@@ -80,6 +82,8 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     ),
     # 3: incident listing and the engine's active-incident scan filter on status, newest first.
     ("CREATE INDEX incidents_status_last_seen_idx ON incidents(status, last_seen)",),
+    # 4: /metrics counts events by kind on every scrape.
+    ("CREATE INDEX events_kind_idx ON events(kind)",),
 )
 
 
@@ -659,19 +663,69 @@ class Store:
             if commit:
                 self.db.commit()
 
-    def events(self, incident_id: str) -> list[dict[str, Any]]:
-        """Get all events for an incident, ordered by time."""
+    def events(
+        self,
+        incident_id: str,
+        limit: int = DEFAULT_EVENT_LIMIT,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """A page of an incident's events, oldest first: the latest `limit`.
+
+        Pass `before_id` (the first id of the page already held) to read the page before it.
+        """
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM events WHERE incident_id = ? ORDER BY id",
-                (incident_id,),
+                "SELECT * FROM events WHERE incident_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                (incident_id, before_id if before_id is not None else 1 << 62, limit),
             ).fetchall()
-            result = []
-            for row in rows:
-                item = dict(row)
-                item["data"] = json.loads(item.pop("data_json") or "{}")
-                result.append(item)
-            return result
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["data"] = json.loads(item.pop("data_json") or "{}")
+            result.append(item)
+        return result
+
+    def count_events(self, incident_id: str) -> int:
+        """Number of events recorded for an incident."""
+        with self.lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM events WHERE incident_id = ?", (incident_id,)
+                ).fetchone()[0]
+            )
+
+    def prune(self, *, older_than_days: int) -> dict[str, int]:
+        """Delete resolved or closed incidents finished more than `older_than_days` ago.
+
+        Their events and remediation executions go with them, in one transaction. Active
+        incidents are never touched, and neither is the audit log.
+
+        Returns:
+            How many incidents, events and executions were removed.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        marks = ",".join("?" * len(CLOSED_STATUSES))
+        old = (
+            f"SELECT id FROM incidents WHERE status IN ({marks}) "
+            "AND COALESCE(resolved_at, last_seen) < ?"
+        )
+        params = (*CLOSED_STATUSES, cutoff)
+        with self.lock:
+            try:
+                events = self.db.execute(
+                    f"DELETE FROM events WHERE incident_id IN ({old})", params
+                ).rowcount
+                executions = self.db.execute(
+                    f"DELETE FROM remediation_executions WHERE incident_id IN ({old})", params
+                ).rowcount
+                incidents = self.db.execute(
+                    f"DELETE FROM incidents WHERE id IN ({old})", params
+                ).rowcount
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+        return {"incidents": incidents, "events": events, "executions": executions}
 
     def add_audit(
         self,

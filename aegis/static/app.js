@@ -613,10 +613,11 @@ function investigationHtml(incident) {
     ${investigation?.fallback_reason ? `<p class="muted chips">Local fallback: ${esc(investigation.fallback_reason)}</p>` : ""}`;
 }
 
-function timelineHtml(events) {
+function timelineHtml(events, total = events.length) {
   // An open incident logs events continuously; rendering them all makes the page grow on each poll.
+  // The API sends only the latest page of events, so the full count comes from events_total.
   const shown = events.slice(-TIMELINE_LIMIT);
-  const hidden = events.length - shown.length;
+  const hidden = total - shown.length;
   return `<h3 class="section-title">Timeline</h3>${hidden ? `<p class="timeline-more">${hidden} earlier events not shown</p>` : ""}
     <ol class="timeline">${shown.map((e) => `<li class="timeline-item kind-${esc(e.kind)}"><small>${esc(fmtStamp(e.at))} · ${esc(e.kind)}</small><p>${esc(e.message)}</p></li>`).join("")}</ol>`;
 }
@@ -647,7 +648,7 @@ function detailHtml(incident) {
     </div>
     ${buttons ? `<div class="actions">${buttons}</div>` : ""}
     ${recommendationHtml(incident)}
-    <div class="columns"><section aria-label="Investigation">${investigationHtml(incident)}</section><section aria-label="Timeline">${timelineHtml(incident.events ?? [])}</section></div>
+    <div class="columns"><section aria-label="Investigation">${investigationHtml(incident)}</section><section aria-label="Timeline">${timelineHtml(incident.events ?? [], incident.events_total)}</section></div>
   </div>`;
 }
 

@@ -37,6 +37,9 @@ SHUTDOWN_JOIN_SECONDS = 15.0
 # How many incidents to scan for a recently resolved one to reopen.
 RECENT_INCIDENT_LOOKBACK = 1000
 
+# How often retention pruning runs; it is a bulk delete, not a per-cycle chore.
+PRUNE_INTERVAL_SECONDS = 3600
+
 # Statuses a quiet incident leaves on its own. A pending recommendation nobody approved
 # expires; approved and executing incidents are an operator's committed action and never
 # resolve underneath it, and investigating ones return to open or pending by themselves.
@@ -136,6 +139,7 @@ class IncidentEngine:
         self._signal_states: dict[str, str] = {}
         self._blind_since: dict[str, float] = {}
         self._clock = time.monotonic
+        self._last_prune: float | None = None
 
     def start(self) -> None:
         """Start the incident detection engine."""
@@ -240,6 +244,7 @@ class IncidentEngine:
             self._resolve_missing(fired_ids, unverified)
         except Exception:
             logger.exception("Resolving quiet incidents failed")
+        self._prune_history()
         return fired
 
     @property
@@ -542,6 +547,24 @@ class IncidentEngine:
                         "was approved; the recommendation expired",
                     )
             self._misses.pop(incident_id, None)
+
+    def _prune_history(self) -> None:
+        """Delete resolved history older than AEGIS_RETENTION_DAYS, at most hourly.
+
+        Never raises: a failed prune is retried next hour and must not fail a cycle.
+        """
+        days = self.settings.retention_days
+        now = self._clock()
+        if days <= 0 or (self._last_prune is not None and now - self._last_prune < PRUNE_INTERVAL_SECONDS):
+            return
+        self._last_prune = now
+        try:
+            removed = self.store.prune(older_than_days=days)
+        except Exception:
+            logger.exception("Pruning history older than %d days failed", days)
+            return
+        if removed["incidents"]:
+            logger.info("Pruned history older than %d days: %s", days, removed)
 
     def _note_degraded(self, degraded: set[str]) -> None:
         """Record once per outage that an incident's signal cannot be read."""

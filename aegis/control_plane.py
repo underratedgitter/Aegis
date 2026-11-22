@@ -53,7 +53,7 @@ from aegis.models import (
 from aegis.remediation import RemediationError, RemediationExecutor, no_remediation_reason
 from aegis.selfmetrics import ControlPlaneCollector
 from aegis.settings import Settings
-from aegis.storage import CLOSED_STATUSES, Store, utc_now
+from aegis.storage import CLOSED_STATUSES, DEFAULT_EVENT_LIMIT, Store, utc_now
 from aegis.supervisor import EngineStatus, SupervisedEngine
 from aegis.telemetry import Telemetry
 
@@ -390,8 +390,13 @@ def batch_approve(request: ApprovalRequest) -> dict[str, Any]:
 
 
 @app.get("/api/incidents/{incident_id}")
-def get_incident(incident_id: str) -> dict[str, Any]:
-    return _incident_with_events(incident_id)
+def get_incident(
+    incident_id: str,
+    events_limit: int = Query(DEFAULT_EVENT_LIMIT, ge=1, le=1000),
+    events_before: int | None = Query(None, ge=1),
+) -> dict[str, Any]:
+    """The incident with its latest events (`events_limit`); `events_before` pages further back."""
+    return _incident_with_events(incident_id, events_limit, events_before)
 
 
 @app.post("/api/incidents/{incident_id}/investigate", response_model=InvestigateResponse, dependencies=PROTECTED)
@@ -431,7 +436,7 @@ def approve(incident_id: str, request: ApprovalRequest) -> ApprovalResponse:
         raise HTTPException(status_code=409, detail="Incident has no pending recommendation")
     store.add_event(incident_id, "approval", f"Human approval recorded from {request.approver}", approval)
     _audit("approve", {"incident_id": incident_id, "approver": request.approver})
-    return ApprovalResponse(**get_incident(incident_id))
+    return ApprovalResponse(**_incident_with_events(incident_id))
 
 
 # A remediation that is executing owns the incident until it finishes; every other
@@ -590,11 +595,17 @@ def _incidents_json() -> Iterator[str]:
     yield f'], "exported_at": {json.dumps(utc_now())}, "count": {count}}}'
 
 
-def _incident_with_events(incident_id: str) -> dict[str, Any]:
+def _incident_with_events(
+    incident_id: str, events_limit: int = DEFAULT_EVENT_LIMIT, events_before: int | None = None
+) -> dict[str, Any]:
     incident = store.get_incident(incident_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    return {**incident, "events": store.events(incident_id)}
+    return {
+        **incident,
+        "events": store.events(incident_id, events_limit, events_before),
+        "events_total": store.count_events(incident_id),
+    }
 
 
 def _service_status(name: str, url: str) -> ServiceStatus:
