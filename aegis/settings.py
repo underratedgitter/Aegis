@@ -33,7 +33,7 @@ class SettingsError(ValueError):
 
 def _env(name: str, default: str) -> Any:
     """Read an environment variable when a Settings instance is built, not at import time."""
-    return field(default_factory=lambda: os.getenv(name, default))
+    return field(default_factory=lambda: os.getenv(name, default), metadata={"env": name})
 
 
 def _env_int(name: str, default: int) -> Any:
@@ -54,7 +54,7 @@ def _env_int(name: str, default: int) -> Any:
         except ValueError:
             return raw
 
-    return field(default_factory=parse)
+    return field(default_factory=parse, metadata={"env": name})
 
 
 def _env_bool(name: str, default: bool) -> Any:
@@ -71,7 +71,7 @@ def _env_bool(name: str, default: bool) -> Any:
             return False
         return raw
 
-    return field(default_factory=parse)
+    return field(default_factory=parse, metadata={"env": name})
 
 
 def _origin_problem(origin: str) -> str | None:
