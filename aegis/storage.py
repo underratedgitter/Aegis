@@ -18,6 +18,53 @@ BUSY_TIMEOUT_MS = 10_000
 # Recent detected/signal events inspected when deciding whether another one is due.
 SIGNAL_LOOKBACK = 200
 
+# Ordered schema migrations. Entry N takes the database from user_version N-1 to N and holds
+# single SQL statements; each entry is applied in one transaction. Never edit a released
+# entry: append a new one.
+MIGRATIONS: tuple[tuple[str, ...], ...] = (
+    # 1: the original schema.
+    (
+        """CREATE TABLE IF NOT EXISTS incidents (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          status TEXT NOT NULL,
+          root_cause_key TEXT NOT NULL,
+          first_seen TEXT NOT NULL,
+          last_seen TEXT NOT NULL,
+          resolved_at TEXT,
+          data_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        """CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          incident_id TEXT NOT NULL,
+          at TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          message TEXT NOT NULL,
+          data_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        "CREATE INDEX IF NOT EXISTS events_incident_idx ON events(incident_id, id)",
+        """CREATE TABLE IF NOT EXISTS remediation_executions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          incident_id TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target TEXT NOT NULL,
+          parameters_json TEXT NOT NULL DEFAULT '{}',
+          approver TEXT NOT NULL,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        )""",
+        """CREATE INDEX IF NOT EXISTS remediation_incident_idx
+          ON remediation_executions(incident_id, id)""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
+          ON remediation_executions(target) WHERE state = 'in_flight'""",
+    ),
+)
+
 
 def utc_now() -> str:
     """Return current UTC time as ISO format string."""
@@ -39,7 +86,7 @@ class Store:
         )
         self.db.row_factory = sqlite3.Row
         self._configure()
-        self._initialize_schema()
+        self._migrate()
 
     def _configure(self) -> None:
         """Enable WAL so readers do not block the writer, and wait out brief lock contention.
@@ -56,51 +103,38 @@ class Store:
         with self.lock:
             self.db.execute("SELECT 1").fetchone()
 
-    def _initialize_schema(self) -> None:
-        """Create database tables if they don't exist."""
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS incidents (
-              id TEXT PRIMARY KEY,
-              title TEXT NOT NULL,
-              severity TEXT NOT NULL,
-              status TEXT NOT NULL,
-              root_cause_key TEXT NOT NULL,
-              first_seen TEXT NOT NULL,
-              last_seen TEXT NOT NULL,
-              resolved_at TEXT,
-              data_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE TABLE IF NOT EXISTS events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              incident_id TEXT NOT NULL,
-              at TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              message TEXT NOT NULL,
-              data_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS events_incident_idx ON events(incident_id, id);
-            CREATE TABLE IF NOT EXISTS remediation_executions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              idempotency_key TEXT NOT NULL UNIQUE,
-              incident_id TEXT NOT NULL,
-              action TEXT NOT NULL,
-              target TEXT NOT NULL,
-              parameters_json TEXT NOT NULL DEFAULT '{}',
-              approver TEXT NOT NULL,
-              state TEXT NOT NULL,
-              attempts INTEGER NOT NULL DEFAULT 0,
-              started_at TEXT NOT NULL,
-              finished_at TEXT,
-              detail_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS remediation_incident_idx
-              ON remediation_executions(incident_id, id);
-            CREATE UNIQUE INDEX IF NOT EXISTS remediation_one_in_flight
-              ON remediation_executions(target) WHERE state = 'in_flight';
-            """
-        )
-        self.db.commit()
+    def _schema_version(self) -> int:
+        return int(self.db.execute("PRAGMA user_version").fetchone()[0])
+
+    def _migrate(self) -> None:
+        """Bring the database up to the latest schema version, one transaction per migration.
+
+        The version lives in `PRAGMA user_version`. A database written before versioning
+        existed reads 0 and runs migration 1, whose statements are all `IF NOT EXISTS`.
+        """
+        latest = len(MIGRATIONS)
+        with self.lock:
+            current = self._schema_version()
+            if current > latest:
+                raise RuntimeError(
+                    f"database schema version {current} is newer than this build supports "
+                    f"({latest}); upgrade Aegis instead of opening it with an older release"
+                )
+            for version in range(current + 1, latest + 1):
+                self._apply_migration(version)
+
+    def _apply_migration(self, version: int) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Another process may have applied it while this one waited for the write lock.
+            if self._schema_version() < version:
+                for statement in MIGRATIONS[version - 1]:
+                    self.db.execute(statement)
+                self.db.execute(f"PRAGMA user_version = {version}")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def _row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         """Convert a database row to a dictionary."""

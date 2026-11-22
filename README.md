@@ -328,6 +328,8 @@ The heartbeat is the time of the last successful cycle. The engine is `degraded`
 
 Incident history lives in SQLite at `AEGIS_DB_PATH` (Compose: the `aegis-data` volume at `/data`). It runs in WAL mode with `synchronous=NORMAL` and a 10 s busy timeout, so reads do not block the engine and brief lock contention is retried instead of failing.
 
+The schema is versioned with `PRAGMA user_version`. On startup the control plane applies any missing migrations from `MIGRATIONS` in `aegis/storage.py`, each in its own transaction, so a database written by an older release upgrades in place and a failed migration leaves it untouched. A database whose version is newer than the running build is refused rather than opened. Take a `make backup` before upgrading a production volume.
+
 Back it up while the stack is running (do not copy the `.db` file by hand: with WAL it is incomplete without its `-wal` file):
 
 ```bash
