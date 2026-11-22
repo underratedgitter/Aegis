@@ -207,11 +207,16 @@ class ApprovalResponse(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
+    """"executed", "already_executed" (this approval ran before) or "dry_run" (nothing changed)."""
+
     status: str = "executed"
     incident_id: str
     action: str
     target: str
     result: dict[str, Any]
+    idempotency_key: str | None = None
+    attempts: int | None = None
+    verification: str | None = None
 
 
 class MetricSnapshot(BaseModel):

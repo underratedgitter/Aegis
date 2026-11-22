@@ -161,7 +161,10 @@ class RemediationExecutor:
         return result
 
     def _record(self, kind: str, **detail: Any) -> None:
+        """Write an audit entry; "action" is the entry's own kind there, so the fix is renamed."""
         if self._audit:
+            if "action" in detail:
+                detail["remediation_action"] = detail.pop("action")
             self._audit(kind, detail)
 
     def _execute(self, incident_id: str, approver: str) -> dict[str, Any]:

@@ -444,7 +444,7 @@ def test_every_outcome_is_audited_with_enough_detail_to_reconstruct_it(tmp_path,
     assert executed == {
         "incident_id": "inc-1",
         "approver": "op",
-        "action": "clear_fault",
+        "remediation_action": "clear_fault",
         "target": "inventory",
         "idempotency_key": first["idempotency_key"],
         "attempts": 1,
