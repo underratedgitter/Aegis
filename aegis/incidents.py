@@ -53,6 +53,9 @@ class Reading:
 
     value: float | None
     available: bool
+    # Unreadable for a known reason that is not a telemetry outage (checkout is down),
+    # so it must not count towards Aegis being blind.
+    explained: bool = False
 
 # ─── Alert Rules ──────────────────────────────────────────────────────────────
 
@@ -239,12 +242,12 @@ class IncidentEngine:
         """Each rule's latest state: "ok", "breaching" or "unavailable"."""
         return dict(self._signal_states)
 
-    def _mark(self, rule: AlertRule, state: str) -> None:
+    def _mark(self, rule: AlertRule, state: str, *, explained: bool = False) -> None:
         """Record a rule's state; only a breach is debounced, so any other state restarts the count."""
         self._signal_states[rule.name] = state
         if state != "breaching":
             self._breaches[rule.name] = 0
-        if state == "unavailable":
+        if state == "unavailable" and not explained:
             self._blind_since.setdefault(rule.name, self._clock())
         else:
             self._blind_since.pop(rule.name, None)
@@ -274,11 +277,14 @@ class IncidentEngine:
         readings = {rule.name: self._read(rule) for rule in RULES}
         liveness = readings[LIVENESS_RULE]
         live = liveness.value is not None and not RULES_BY_NAME[LIVENESS_RULE].fires(liveness.value)
+        # Prometheus answered and says checkout is down: its other series are gone because
+        # the service is, which is the checkout_down incident's story and not a blind spot.
+        down = liveness.value is not None and not live
         resolved: dict[str, Reading] = {}
         for name, reading in readings.items():
             empty = reading.available and reading.value is None
             if empty and not (live and name != LIVENESS_RULE):
-                reading = Reading(None, available=False)
+                reading = Reading(None, available=False, explained=down and name != LIVENESS_RULE)
             resolved[name] = reading
         return resolved
 
@@ -288,7 +294,7 @@ class IncidentEngine:
         """Evaluate one rule; return the incident it fired or updated, if any."""
         reading = readings[rule.name]
         if not reading.available:
-            self._mark(rule, "unavailable")
+            self._mark(rule, "unavailable", explained=reading.explained)
             unverified.add(rule.root_cause_key)
             return None
         value = reading.value

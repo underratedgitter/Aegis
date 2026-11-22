@@ -41,15 +41,14 @@ class Telemetry:
 
 
 def engine_for(tmp_path, telemetry, **overrides):
-    settings = Settings(
-        db_path=str(tmp_path / "db.sqlite"),
-        runbook_dir="runbooks",
-        detection_cycles=2,
-        resolution_cycles=2,
-        blind_seconds=0,
-        reopen_cooldown_seconds=0,
+    options = {
+        "detection_cycles": 2,
+        "resolution_cycles": 2,
+        "blind_seconds": 0,
+        "reopen_cooldown_seconds": 0,
         **overrides,
-    )
+    }
+    settings = Settings(db_path=str(tmp_path / "db.sqlite"), runbook_dir="runbooks", **options)
     store = Store(settings.db_path)
     engine = SupervisedEngine(settings, store, telemetry)
     engine._spawn_investigation = lambda incident_id: store.transition_status(  # type: ignore[method-assign]
@@ -326,3 +325,53 @@ def test_the_local_recommendation_clears_the_fault_that_fired(tmp_path, monkeypa
     result = agent.investigate("inc-1")
 
     assert result["recommendation"]["parameters"] == {"fault": fault}
+
+
+# A stopped checkout is not blindness ----------------------------------------------------
+
+
+def blind_incidents(store):
+    return [i for i in store.list_incidents(limit=50) if i["root_cause_key"] == BLIND_ROOT]
+
+
+def run_for(engine, clock, seconds, step=5):
+    for _ in range(seconds // step):
+        clock[0] += step
+        engine._supervise_cycle()
+
+
+def test_a_down_checkout_opens_its_own_incident_but_not_a_blind_one(tmp_path):
+    # Prometheus answers: checkout is down (1.0) and so has no other series.
+    telemetry = Telemetry(**{**dict.fromkeys(QUERY), DOWN: 1.0})
+    engine, store = engine_for(tmp_path, telemetry, blind_seconds=20)
+    clock = [1000.0]
+    engine._clock = lambda: clock[0]
+
+    run_for(engine, clock, 60)
+
+    roots = [i["root_cause_key"] for i in store.list_incidents(limit=50)]
+    assert roots == ["service:checkout"]
+    assert engine.status().state == "degraded"  # the other signals still cannot be judged
+
+
+def test_unreadable_prometheus_still_opens_the_blind_incident(tmp_path):
+    telemetry = Telemetry(**dict.fromkeys(QUERY, "error"))
+    engine, store = engine_for(tmp_path, telemetry, blind_seconds=20)
+    clock = [1000.0]
+    engine._clock = lambda: clock[0]
+
+    run_for(engine, clock, 60)
+
+    assert len(blind_incidents(store)) == 1
+
+
+def test_missing_liveness_series_is_still_blindness(tmp_path):
+    # Prometheus has no checkout target at all: nothing can be judged, and nothing explains why.
+    telemetry = Telemetry(**dict.fromkeys(QUERY))
+    engine, store = engine_for(tmp_path, telemetry, blind_seconds=20)
+    clock = [1000.0]
+    engine._clock = lambda: clock[0]
+
+    run_for(engine, clock, 60)
+
+    assert len(blind_incidents(store)) == 1
