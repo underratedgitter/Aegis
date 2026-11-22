@@ -133,9 +133,13 @@ class TestWebUiSendsKey:
 
     def test_write_calls_send_bearer_header(self):
         assert "Authorization = `Bearer ${key}`" in self.APP_JS
-        # Every POST goes through postOptions, which attaches the header.
+        # Every POST is built by postOptions, which attaches the header, and every write in the
+        # UI goes through the single post() helper that uses it.
         assert self.APP_JS.count('method: "POST"') == 1
-        assert self.APP_JS.count("postOptions(") >= 4
+        assert self.APP_JS.count("getJson(url, postOptions(body))") >= 1
+        assert self.APP_JS.count("await post(") >= 4
+        # The protected audit GET carries the header too.
+        assert "headers: authHeaders()" in self.APP_JS
 
     def test_key_is_kept_out_of_urls_and_persistent_storage(self):
         assert "localStorage" not in self.APP_JS
@@ -164,5 +168,8 @@ class TestWebUiHandlesExecutingStatus:
 
     def test_action_buttons_are_only_offered_in_their_own_status(self):
         app_js = (self.STATIC / "app.js").read_text()
-        assert 'incident.status === "recommendation_pending" ? `<button onclick="approveIncident' in app_js
+        # Buttons are delegated (data-action), not inline handlers, and gated on status.
+        assert 'const pending = incident.status === "recommendation_pending"' in app_js
         assert 'const approved = incident.status === "approved"' in app_js
+        assert 'pending ? actionButton("approve"' in app_js
+        assert 'approved ? actionButton("execute"' in app_js
