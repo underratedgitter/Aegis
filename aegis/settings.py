@@ -104,6 +104,11 @@ class Settings:
     max_body_bytes: int = _env_int("AEGIS_MAX_BODY_BYTES", 65536)
     cors_origins_raw: str = _env("AEGIS_CORS_ORIGINS", "")
 
+    # Detection
+    detection_cycles: int = _env_int("AEGIS_DETECTION_CYCLES", 2)
+    blind_seconds: int = _env_int("AEGIS_BLIND_SECONDS", 300)
+    reopen_cooldown_seconds: int = _env_int("AEGIS_REOPEN_COOLDOWN_SECONDS", 300)
+
     def __post_init__(self) -> None:
         problems: list[str] = []
         for name in ("prometheus_url", "loki_url", "checkout_url", "inventory_url"):
@@ -121,6 +126,9 @@ class Settings:
             "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", 1),
             "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", 1),
             "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", 1),
+            "AEGIS_DETECTION_CYCLES": ("detection_cycles", 1),
+            "AEGIS_BLIND_SECONDS": ("blind_seconds", 0),
+            "AEGIS_REOPEN_COOLDOWN_SECONDS": ("reopen_cooldown_seconds", 0),
         }
         for env_name, (attr, minimum) in minimums.items():
             value = getattr(self, attr)

@@ -7,6 +7,8 @@ import math
 import threading
 import time
 import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from aegis.agent import AgentInvestigator
@@ -14,6 +16,7 @@ from aegis.anomaly import RollingZScoreDetector
 from aegis.models import AlertRule, Severity
 from aegis.queries import (
     CHECKOUT_CPU_BURN,
+    CHECKOUT_DOWN,
     CHECKOUT_ERROR_RATE,
     CHECKOUT_P95_LATENCY,
     DEPENDENCY_ERROR_THRESHOLD,
@@ -30,6 +33,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_JOIN_SECONDS = 15.0
+
+# How many incidents to scan for a recently resolved one to reopen.
+RECENT_INCIDENT_LOOKBACK = 1000
+
+# Root cause under which prolonged blindness is recorded.
+BLIND_ROOT = "telemetry:blind"
+
+# Fraction of the dependency threshold below which checkout symptoms stop being
+# attributed to an already-open dependency incident.
+ATTRIBUTION_RELEASE = 0.5
+
+
+@dataclass(frozen=True)
+class Reading:
+    """One signal as read this cycle.
+
+    `value` is None when nothing numeric came back. `available` says whether that
+    can be trusted: False means the signal could not be read, so it must not be
+    taken as healthy.
+    """
+
+    value: float | None
+    available: bool
 
 # ─── Alert Rules ──────────────────────────────────────────────────────────────
 
@@ -66,7 +92,24 @@ RULES = (
         threshold=0.5,
         root_cause_key="service:checkout:cpu",
     ),
+    AlertRule(
+        name="checkout_down",
+        title="Checkout is not answering metric scrapes",
+        severity=Severity.HIGH,
+        query=CHECKOUT_DOWN,
+        threshold=0.5,
+        root_cause_key="service:checkout",
+    ),
 )
+
+RULES_BY_NAME = {rule.name: rule for rule in RULES}
+
+# The rule whose reading says whether the checkout target is alive, which decides
+# whether an empty result from the others means "quiet" or "unknown".
+LIVENESS_RULE = "checkout_down"
+INVENTORY_DEPENDENCY_RULE = "inventory_dependency_errors"
+DEPENDENCY_ROOT = "dependency:inventory"
+DEPENDENCY_SYMPTOMS = frozenset({"checkout_error_rate", "checkout_p95_latency"})
 
 
 class IncidentEngine:
@@ -84,6 +127,11 @@ class IncidentEngine:
         self._investigations_lock = threading.Lock()
         self._misses: dict[str, int] = {}
         self._degraded: set[str] = set()
+        self._cycle_lock = threading.Lock()
+        self._breaches: dict[str, int] = {}
+        self._signal_states: dict[str, str] = {}
+        self._blind_since: dict[str, float] = {}
+        self._clock = time.monotonic
 
     def start(self) -> None:
         """Start the incident detection engine."""
@@ -149,20 +197,27 @@ class IncidentEngine:
     def run_once(self) -> list[dict[str, Any]]:
         """Execute one evaluation cycle of all alert rules.
 
-        Each rule is isolated: a failure reading or recording one signal is
-        logged and does not stop the others. A signal that could not be read is
-        "unverified", and the incidents it drives are never auto-resolved on the
-        strength of a missing reading.
+        Cycles are serialised, so a manual run cannot race the background loop into
+        opening the same incident twice. Each rule is isolated: a failure reading or
+        recording one signal is logged and does not stop the others. A signal that
+        could not be read is "unavailable", and the incidents it drives are never
+        auto-resolved on the strength of a missing reading.
         """
+        with self._cycle_lock:
+            return self._run_cycle()
+
+    def _run_cycle(self) -> list[dict[str, Any]]:
         fired: list[dict[str, Any]] = []
         fired_ids: set[str] = set()
         unverified: set[str] = set()
+        readings = self._read_all()
 
         for rule in RULES:
             try:
-                incident = self._evaluate_rule(rule, unverified)
+                incident = self._evaluate_rule(rule, readings, unverified)
             except Exception:
                 logger.exception("Evaluating rule %s failed", rule.name)
+                self._mark(rule, "unavailable")
                 unverified.add(rule.root_cause_key)
                 continue
             if incident:
@@ -170,38 +225,97 @@ class IncidentEngine:
                 fired_ids.add(incident["id"])
 
         try:
+            blind = self._check_blind()
+            if blind:
+                fired.append(blind)
+                fired_ids.add(blind["id"])
+        except Exception:
+            logger.exception("Recording telemetry blindness failed")
+
+        try:
             self._resolve_missing(fired_ids, unverified)
         except Exception:
             logger.exception("Resolving quiet incidents failed")
         return fired
 
-    def _evaluate_rule(self, rule: AlertRule, unverified: set[str]) -> dict[str, Any] | None:
-        """Evaluate one rule; return the incident it fired or updated, if any."""
-        result = self.telemetry.prometheus_query(rule.query)
+    @property
+    def signal_states(self) -> dict[str, str]:
+        """Each rule's latest state: "ok", "breaching" or "unavailable"."""
+        return dict(self._signal_states)
+
+    def _mark(self, rule: AlertRule, state: str) -> None:
+        """Record a rule's state; only a breach is debounced, so any other state restarts the count."""
+        self._signal_states[rule.name] = state
+        if state != "breaching":
+            self._breaches[rule.name] = 0
+        if state == "unavailable":
+            self._blind_since.setdefault(rule.name, self._clock())
+        else:
+            self._blind_since.pop(rule.name, None)
+
+    def _read(self, rule: AlertRule) -> Reading:
+        """Read one rule's signal; a failed or non-numeric read is unavailable, never zero."""
+        try:
+            result = self.telemetry.prometheus_query(rule.query)
+        except Exception:
+            logger.exception("Reading rule %s failed", rule.name)
+            return Reading(None, available=False)
         if result.get("error"):
-            # Feeding a failed read to the detector as 0.0 would corrupt its baseline.
             logger.warning("Rule %s unreadable: %s", rule.name, result["error"])
+            return Reading(None, available=False)
+        value = result.get("value")
+        if value is None or not math.isfinite(value):
+            return Reading(None, available=True)
+        return Reading(float(value), available=True)
+
+    def _read_all(self) -> dict[str, Reading]:
+        """Read every signal once per cycle, so correlation and detection see the same numbers.
+
+        An empty result has two meanings. While the checkout target answers scrapes it
+        is a quiet service (no traffic, no error series yet), which is healthy. When
+        that cannot be confirmed it is missing data, which says nothing about health.
+        """
+        readings = {rule.name: self._read(rule) for rule in RULES}
+        liveness = readings[LIVENESS_RULE]
+        live = liveness.value is not None and not RULES_BY_NAME[LIVENESS_RULE].fires(liveness.value)
+        resolved: dict[str, Reading] = {}
+        for name, reading in readings.items():
+            empty = reading.available and reading.value is None
+            if empty and not (live and name != LIVENESS_RULE):
+                reading = Reading(None, available=False)
+            resolved[name] = reading
+        return resolved
+
+    def _evaluate_rule(
+        self, rule: AlertRule, readings: dict[str, Reading], unverified: set[str]
+    ) -> dict[str, Any] | None:
+        """Evaluate one rule; return the incident it fired or updated, if any."""
+        reading = readings[rule.name]
+        if not reading.available:
+            self._mark(rule, "unavailable")
             unverified.add(rule.root_cause_key)
             return None
-        value = result.get("value")
-        anomaly = self.detector.observe(rule.name, float(value or 0.0))
+        value = reading.value
+        # Feeding an empty reading to the detector as 0.0 would corrupt its baseline.
+        anomaly = self.detector.observe(rule.name, value) if value is not None else None
 
         if not rule.fires(value):
+            self._mark(rule, "ok")
             return None
 
-        root = rule.root_cause_key
-        # Correlation: if checkout symptoms exist with inventory dependency errors,
-        # rewrite root cause to dependency:inventory
-        if rule.name in {"checkout_error_rate", "checkout_p95_latency"}:
-            dependency_result = self.telemetry.prometheus_query(INVENTORY_DEPENDENCY_ERRORS)
-            if dependency_result.get("error"):
-                # Recording under the wrong root would open a duplicate incident.
-                logger.warning("Dependency check unreadable for rule %s", rule.name)
-                unverified.update({root, "dependency:inventory"})
-                return None
-            dependency = dependency_result.get("value")
-            if dependency and dependency > DEPENDENCY_ERROR_THRESHOLD:
-                root = "dependency:inventory"
+        root = self._attribute(rule, readings, unverified)
+        if root is None:
+            self._mark(rule, "unavailable")
+            return None
+        self._mark(rule, "breaching")
+        self._breaches[rule.name] = self._breaches.get(rule.name, 0) + 1
+
+        # An open incident is refreshed on every breach; a new one needs K in a row.
+        if (
+            self.store.find_active_by_root(root) is None
+            and self._breaches[rule.name] < self.settings.detection_cycles
+        ):
+            return None
 
         evidence = {
             "rule": rule.name,
@@ -209,25 +323,117 @@ class IncidentEngine:
             "value": value,
             "threshold": rule.threshold,
             # A flat baseline yields an infinite z-score, which JSON cannot represent.
-            "z_score": anomaly.z_score if anomaly.z_score is None or math.isfinite(anomaly.z_score) else None,
-            "baseline": anomaly.baseline,
+            "z_score": anomaly.z_score if anomaly and anomaly.z_score is not None and math.isfinite(anomaly.z_score) else None,
+            "baseline": anomaly.baseline if anomaly else None,
             "evaluated_at": utc_now(),
             "source": "prometheus",
         }
+        return self._record(root, rule.title, rule.severity, evidence)
 
-        # Correlation is based on the root-cause key, not the incident ID.
-        # A fresh ID allows the same fault pattern to be recorded again after resolution.
-        incident_id = "inc-" + uuid.uuid4().hex[:10]
+    def _attribute(
+        self, rule: AlertRule, readings: dict[str, Reading], unverified: set[str]
+    ) -> str | None:
+        """Pick the root cause a firing rule belongs to; None when it cannot be decided.
+
+        Checkout symptoms with inventory dependency errors are attributed to the
+        dependency. Once that incident is open the attribution holds until the errors
+        fall to half the threshold, so a reading hovering at the threshold cannot split
+        one fault into two incidents.
+        """
+        root = rule.root_cause_key
+        if rule.name not in DEPENDENCY_SYMPTOMS:
+            return root
+        dependency = readings[INVENTORY_DEPENDENCY_RULE]
+        if not dependency.available:
+            # Recording under the wrong root would open a duplicate incident.
+            logger.warning("Dependency check unreadable for rule %s", rule.name)
+            unverified.update({root, DEPENDENCY_ROOT})
+            return None
+        level = dependency.value or 0.0
+        if level > DEPENDENCY_ERROR_THRESHOLD or (
+            level > DEPENDENCY_ERROR_THRESHOLD * ATTRIBUTION_RELEASE
+            and self.store.find_active_by_root(DEPENDENCY_ROOT)
+        ):
+            return DEPENDENCY_ROOT
+        return root
+
+    def _record(
+        self,
+        root: str,
+        title: str,
+        severity: Severity,
+        evidence: dict[str, Any],
+        *,
+        investigate: bool = True,
+    ) -> dict[str, Any]:
+        """Add evidence to the root cause's active incident, opening or reopening one if needed.
+
+        Correlation is by root-cause key, not incident ID. A recurrence soon after
+        resolution reopens that incident; after the cooldown the fault is recorded
+        again under a fresh ID.
+        """
+        reopened = self._reopen_recent(root)
         incident, created = self.store.upsert_incident(
-            incident_id, rule.title, rule.severity.value, root, evidence
+            "inc-" + uuid.uuid4().hex[:10], title, severity.value, root, evidence
         )
-
-        if created and self.store.transition_status(incident["id"], "open", "investigating"):
+        if (
+            investigate
+            and (created or reopened)
+            and self.store.transition_status(incident["id"], "open", "investigating")
+        ):
             self.store.add_event(
                 incident["id"], "investigation_started", "Aegis is collecting evidence"
             )
             self._spawn_investigation(incident["id"])
         return incident
+
+    def _reopen_recent(self, root: str) -> bool:
+        """Reopen the incident for this root cause if it resolved within the cooldown."""
+        cooldown = self.settings.reopen_cooldown_seconds
+        if cooldown <= 0 or self.store.find_active_by_root(root):
+            return False
+        cutoff = datetime.now(UTC) - timedelta(seconds=cooldown)
+        for incident in self.store.list_incidents(limit=RECENT_INCIDENT_LOOKBACK):
+            if incident["root_cause_key"] != root or incident["status"] != "resolved":
+                continue
+            resolved_at = incident.get("resolved_at")
+            if not resolved_at or datetime.fromisoformat(resolved_at) < cutoff:
+                continue
+            if self.store.transition_status(incident["id"], "resolved", "open"):
+                self.store.update_incident(incident["id"], resolved_at=None)
+                self.store.add_event(
+                    incident["id"],
+                    "reopened",
+                    f"Signal returned within {cooldown}s of resolution; reopened instead of opening a new incident",
+                )
+                return True
+        return False
+
+    def _check_blind(self) -> dict[str, Any] | None:
+        """Open one telemetry incident once any signal has been unreadable for too long.
+
+        Without it an outage of Prometheus or of the checkout target would look like a
+        healthy service forever. The incident is for the operator: there is nothing for
+        the investigator to analyse, and it resolves when the signals come back.
+        """
+        limit = self.settings.blind_seconds
+        if limit <= 0:
+            return None
+        now = self._clock()
+        blind = sorted(name for name, since in self._blind_since.items() if now - since > limit)
+        if not blind:
+            return None
+        evidence = {
+            "rule": "telemetry_blind",
+            "blind_rules": blind,
+            "blind_seconds": round(now - min(self._blind_since[name] for name in blind)),
+            "threshold": limit,
+            "evaluated_at": utc_now(),
+            "source": "aegis",
+        }
+        return self._record(
+            BLIND_ROOT, "Aegis cannot read its telemetry", Severity.HIGH, evidence, investigate=False
+        )
 
     def _spawn_investigation(self, incident_id: str) -> None:
         """Investigate in a background thread that `stop()` can wait for."""
