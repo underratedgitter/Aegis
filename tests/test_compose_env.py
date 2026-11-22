@@ -16,6 +16,8 @@ PASSTHROUGH = {
     "AEGIS_AUTH_FAIL_MAX": ("auth_fail_max", ("control", "checkout", "inventory")),
     "AEGIS_AUTH_FAIL_WINDOW": ("auth_fail_window", ("control", "checkout", "inventory")),
     "AEGIS_MAX_BODY_BYTES": ("max_body_bytes", ("control", "checkout", "inventory")),
+    "AEGIS_POLL_SECONDS": ("poll_seconds", ("control",)),
+    "AEGIS_RESOLUTION_CYCLES": ("resolution_cycles", ("control",)),
     "AEGIS_SIGNAL_EVENT_INTERVAL": ("signal_event_interval", ("control",)),
     "AEGIS_DETECTION_CYCLES": ("detection_cycles", ("control",)),
     "AEGIS_BLIND_SECONDS": ("blind_seconds", ("control",)),
@@ -62,3 +64,10 @@ def test_dry_run_is_passed_with_the_settings_default(monkeypatch):
     value = COMPOSE["services"]["control"]["environment"]["AEGIS_REMEDIATION_DRY_RUN"]
 
     assert value == "${AEGIS_REMEDIATION_DRY_RUN:-" + str(Settings().remediation_dry_run).lower() + "}"
+
+
+@pytest.mark.parametrize("service", ["checkout", "inventory"])
+def test_demo_services_get_enough_cpu_for_a_healthy_latency_baseline(service):
+    # At 0.25 CPU a healthy checkout's p95 crossed the 750 ms alert and opened false latency incidents.
+    cpus = float(COMPOSE["services"][service]["deploy"]["resources"]["limits"]["cpus"])
+    assert cpus >= 1.0
