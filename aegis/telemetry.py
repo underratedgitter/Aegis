@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from pathlib import Path
@@ -11,12 +12,15 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from aegis.breaker import CircuitBreaker
+from aegis.errors import error_summary
 from aegis.models import MetricSnapshot, SLOSnapshot, TelemetryStatus
 from aegis.queries import CHECKOUT_ERRORS_30M, CHECKOUT_REQUESTS_30M, SNAPSHOT_QUERIES
 from aegis.selfmetrics import BACKEND_ERRORS
 
 if TYPE_CHECKING:
     from aegis.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 # Every outbound call has explicit connect and read timeouts.
 CONNECT_TIMEOUT_SECONDS = 1.0
@@ -101,15 +105,23 @@ class Telemetry:
             return {"query": query, "value": value, "series": result, "source": "prometheus"}
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             BACKEND_ERRORS.labels("prometheus").inc()
+            logger.warning("Prometheus query failed: %s", exc)
+            summary = error_summary(exc)
             if self._is_outage(exc) or isinstance(exc, httpx.InvalidURL):
-                self.prometheus_breaker.record_failure(str(exc))
+                self.prometheus_breaker.record_failure(summary)
             else:
                 # A 4xx for a bad query still proves the server is answering.
                 self.prometheus_breaker.record_success()
-            return {"query": query, "value": None, "error": f"HTTP error: {exc}", "source": "prometheus"}
+            return {"query": query, "value": None, "error": f"HTTP error: {summary}", "source": "prometheus"}
         except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
             BACKEND_ERRORS.labels("prometheus").inc()
-            return {"query": query, "value": None, "error": f"Parse error: {exc}", "source": "prometheus"}
+            logger.warning("Prometheus response could not be parsed: %s", exc)
+            return {
+                "query": query,
+                "value": None,
+                "error": f"Parse error: {error_summary(exc)}",
+                "source": "prometheus",
+            }
 
     @staticmethod
     def _is_outage(exc: Exception) -> bool:
@@ -209,8 +221,10 @@ class Telemetry:
             )
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             BACKEND_ERRORS.labels("loki").inc()
-            self.loki_breaker.record_failure(str(exc))
-            return TelemetryStatus(available=False, error=str(exc))
+            logger.warning("Loki readiness check failed: %s", exc)
+            summary = error_summary(exc)
+            self.loki_breaker.record_failure(summary)
+            return TelemetryStatus(available=False, error=summary)
         if response.status_code >= 500:
             BACKEND_ERRORS.labels("loki").inc()
             self.loki_breaker.record_failure(f"HTTP {response.status_code}")

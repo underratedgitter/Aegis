@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, Field
 
 from aegis.breaker import BreakerStatus  # noqa: TC001 - pydantic resolves the field type at runtime
+from aegis.errors import error_summary
 from aegis.incidents import IncidentEngine
 from aegis.selfmetrics import ENGINE_CYCLE_FAILURES, ENGINE_CYCLE_SECONDS
 from aegis.storage import utc_now
@@ -202,7 +203,7 @@ class SupervisedEngine(IncidentEngine):
             self._cycles_total += 1
             self._failures_total += 1
             self._consecutive_failures += 1
-            self._last_error = f"{type(error).__name__}: {error}"[:ERROR_MAX_CHARS]
+            self._last_error = error_summary(error)[:ERROR_MAX_CHARS]
             self._last_error_iso = utc_now()
             if duration is not None:
                 self._last_cycle_seconds = round(duration, 3)

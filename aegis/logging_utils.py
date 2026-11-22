@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from aegis.errors import redact_urls
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -16,7 +18,7 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname.lower(),
             "service": getattr(record, "service", "aegis"),
             "host": socket.gethostname(),
-            "message": record.getMessage(),
+            "message": redact_urls(record.getMessage()),
         }
         for key in ("request_id", "route", "status", "duration_ms", "fault", "dependency"):
             value = getattr(record, key, None)

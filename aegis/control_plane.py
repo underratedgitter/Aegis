@@ -24,6 +24,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from aegis.agent import LLM_BREAKER_COOLDOWN_SECONDS, LLM_BREAKER_FAILURES, AgentInvestigator
 from aegis.auth import AuthFailureLimiter, bearer_header, presented_token, token_matches
 from aegis.breaker import CircuitBreaker
+from aegis.errors import error_summary
 from aegis.http_security import (
     DOCS_CSP,
     UI_CSP,
@@ -464,7 +465,7 @@ def chaos(request: ChaosRequest) -> ChaosResponse:
         _audit("chaos_inject", {"service": request.service, "fault": request.fault})
         return ChaosResponse(status="injected", service=request.service, result=response.json())
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Demo service unavailable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Demo service unavailable: {error_summary(exc)}") from exc
 
 
 @app.get("/api/metrics")
@@ -495,7 +496,8 @@ def _service_status(name: str, url: str) -> ServiceStatus:
         response = httpx.get(f"{url.rstrip('/')}/healthz", timeout=1)
         return ServiceStatus(name=name, available=response.is_success, status_code=response.status_code)
     except httpx.HTTPError as exc:
-        return ServiceStatus(name=name, available=False, error=str(exc))
+        logger.warning("Health check of %s failed: %s", name, exc)
+        return ServiceStatus(name=name, available=False, error=error_summary(exc))
 
 
 def _prometheus_status() -> TelemetryStatus:

@@ -25,6 +25,19 @@ class TestJsonFormatter:
         assert "host" in payload
         assert "ts" in payload
 
+    def test_format_strips_credentials_from_urls_in_the_message(self):
+        record = logging.LogRecord(
+            name="aegis.test",
+            level=logging.WARNING,
+            pathname=__file__,
+            lineno=1,
+            msg="query to %s failed",
+            args=("http://admin:hunter2@prometheus:9090/api",),
+            exc_info=None,
+        )
+        payload = json.loads(JsonFormatter().format(record))
+        assert payload["message"] == "query to http://prometheus:9090/api failed"
+
     def test_format_uses_service_attribute_when_present(self):
         formatter = JsonFormatter()
         record = logging.LogRecord(

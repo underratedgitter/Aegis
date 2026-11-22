@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aegis.breaker import CircuitBreaker
+from aegis.errors import error_summary
 from aegis.models import (
     Evidence,
     Investigation,
@@ -110,9 +111,7 @@ class AgentInvestigator:
                 logger.warning("LLM investigation of %s failed: %s", incident_id, exc)
                 result = self._local_investigation(incident)
                 result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
-                result["fallback_reason"] = _clip(
-                    f"{type(exc).__name__}: {exc}", FALLBACK_REASON_MAX_CHARS
-                )
+                result["fallback_reason"] = _clip(error_summary(exc), FALLBACK_REASON_MAX_CHARS)
         else:
             result = self._local_investigation(incident)
             result["mode"] = InvestigationMode.LOCAL_FALLBACK.value
@@ -146,7 +145,7 @@ class AgentInvestigator:
             result = self._llm_investigation(incident)
         except Exception as exc:
             BACKEND_ERRORS.labels("llm").inc()
-            self.llm_breaker.record_failure(f"{type(exc).__name__}: {exc}")
+            self.llm_breaker.record_failure(error_summary(exc))
             raise
         self.llm_breaker.record_success()
         return result
@@ -395,7 +394,7 @@ class AgentInvestigator:
             return self._call_tool(call.function.name, arguments, incident_id)
         except Exception as exc:
             logger.warning("LLM tool %s failed for %s: %s", call.function.name, incident_id, exc)
-            return {"error": _clip(f"{type(exc).__name__}: {exc}", 300)}
+            return {"error": _clip(error_summary(exc), 300)}
 
     @staticmethod
     def _prompt_incident(incident: dict[str, Any]) -> dict[str, Any]:
